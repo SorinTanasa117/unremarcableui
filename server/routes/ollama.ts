@@ -57,12 +57,75 @@ interface ExtractedEvidence {
   credibilityScore: number;
 }
 
+function extractEvidenceHeuristically(url: string, rawText: string): ExtractedEvidence {
+  const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const title = lines[0]?.slice(0, 100) || 'Unknown Title';
+
+  let publisherAndDate = 'Unknown';
+  try {
+    const parsedUrl = new URL(url);
+    const domain = parsedUrl.hostname.replace('www.', '');
+    publisherAndDate = domain.charAt(0).toUpperCase() + domain.slice(1);
+
+    const datePattern = /\b(19|20)\d{2}[-/](0[1-9]|1[0-2])[-/](0[1-9]|[12]\d|3[01])\b|\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2},? \d{4}\b/i;
+    const dateMatch = rawText.match(datePattern);
+    if (dateMatch) {
+      publisherAndDate += ` / ${dateMatch[0]}`;
+    }
+  } catch {}
+
+  const sentences: string[] = [];
+  const quotes: string[] = [];
+
+  for (const line of lines) {
+    if (line.includes('{') || line.includes('}') || line.includes('class=') || line.includes('div>')) continue;
+
+    const parts = line.split(/[.!?]\s+/);
+    for (const part of parts) {
+      const clean = part.trim().replace(/\s+/g, ' ');
+      if (clean.length > 45 && clean.length < 250) {
+        if (clean.includes('"') || clean.includes('“') || clean.includes('”') || clean.startsWith('-') || clean.startsWith('—')) {
+          quotes.push(clean);
+        } else {
+          sentences.push(clean);
+        }
+      }
+    }
+  }
+
+  const uniqueClaims = Array.from(new Set(sentences)).slice(0, 4);
+  const uniqueQuotes = Array.from(new Set(quotes)).slice(0, 3);
+
+  if (uniqueClaims.length === 0) {
+    uniqueClaims.push(lines.find(l => l.length > 50)?.slice(0, 150) || 'Webpage was browsed successfully.');
+  }
+
+  return {
+    url,
+    title,
+    publisherAndDate,
+    claims: uniqueClaims,
+    quotes: uniqueQuotes,
+    relevanceScore: 4,
+    credibilityScore: 4,
+  };
+}
+
 async function extractEvidenceFromPage(
   model: string,
   url: string,
   rawText: string,
   signal: AbortSignal
 ): Promise<ExtractedEvidence> {
+  // To keep speed and protect shared memory (LPDDR5) from choking, we bypass LLM sub-calls
+  // for page evidence extraction unless explicitly disabled. Calling the same LLM inside the
+  // tool-loop evicts/invalidates the main session's context/prompt cache, forcing a complete
+  // context re-evaluation on every browse step. Fast heuristic extraction runs in 0ms and keeps
+  // the main prompt cache 100% warm.
+  if (process.env.FAST_HEURISTIC_EXTRACTION !== 'false') {
+    return extractEvidenceHeuristically(url, rawText);
+  }
+
   const systemPrompt = `You are a precise data extraction agent. Analyze the provided webpage text and extract structured evidence as JSON.
 Respond ONLY with a JSON object in this format:
 {
