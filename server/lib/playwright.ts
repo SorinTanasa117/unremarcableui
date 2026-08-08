@@ -38,6 +38,17 @@ export async function getBrowser(): Promise<BrowserContext> {
       locale: 'en-US',
       timezoneId: 'America/New_York',
     });
+
+    // Optimize page loading by blocking non-essential resources (images, stylesheets, fonts, media)
+    // to minimize memory and CPU utilization of headless Chromium.
+    await context.route('**/*', (route) => {
+      const type = route.request().resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    });
   }
   return context;
 }
