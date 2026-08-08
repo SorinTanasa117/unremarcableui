@@ -61,6 +61,22 @@ export default function App() {
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
   const [rightPanelTab, setRightPanelTab] = useState<RightTab>('terminal');
 
+  // Hotkeys for toggling sidebars: Alt+C (Chats), Alt+T (Tools)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.altKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        setSidebarOpen((o) => !o);
+      }
+      if (e.altKey && (e.key === 't' || e.key === 'T')) {
+        e.preventDefault();
+        setRightPanelOpen((o) => !o);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   // Load session list on startup
   useEffect(() => {
     fetchSessionsList();
@@ -354,6 +370,10 @@ export default function App() {
               persona={activePersona}
               contextSize={contextSize}
               thinkingMode={thinkingMode}
+              sidebarOpen={sidebarOpen}
+              rightPanelOpen={rightPanelOpen}
+              onToggleSidebar={() => setSidebarOpen((o) => !o)}
+              onToggleRightPanel={() => setRightPanelOpen((o) => !o)}
             />
           </div>
 
