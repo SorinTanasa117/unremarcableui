@@ -15,6 +15,10 @@ interface Props {
   persona: string;
   contextSize: number;
   thinkingMode: boolean;
+  sidebarOpen: boolean;
+  rightPanelOpen: boolean;
+  onToggleSidebar: () => void;
+  onToggleRightPanel: () => void;
 }
 
 export function ChatPanel({
@@ -29,6 +33,10 @@ export function ChatPanel({
   persona,
   contextSize,
   thinkingMode,
+  sidebarOpen,
+  rightPanelOpen,
+  onToggleSidebar,
+  onToggleRightPanel,
 }: Props) {
   const [input, setInput] = useState('');
   const [storyMode, setStoryMode] = useState(false);
@@ -68,7 +76,65 @@ export function ChatPanel({
   };
 
   return (
-    <div className="flex-col" style={{ height: '100%', display: 'flex' }}>
+    <div className="flex-col" style={{ height: '100%', display: 'flex', position: 'relative' }}>
+      {/* Floating Left Sidebar Toggle (visible only when collapsed) */}
+      {!sidebarOpen && (
+        <button
+          onClick={onToggleSidebar}
+          style={{
+            position: 'absolute',
+            left: 12,
+            top: 12,
+            zIndex: 100,
+            background: 'var(--accent)',
+            border: 'none',
+            borderRadius: '50%',
+            width: 32,
+            height: 32,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#fff',
+            cursor: 'pointer',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            fontSize: 14,
+            transition: 'background 0.2s',
+          }}
+          title="Open Chats List (Alt+C)"
+        >
+          💬
+        </button>
+      )}
+
+      {/* Floating Right Panel Toggle (visible only when collapsed) */}
+      {!rightPanelOpen && (
+        <button
+          onClick={onToggleRightPanel}
+          style={{
+            position: 'absolute',
+            right: 12,
+            top: 12,
+            zIndex: 100,
+            background: 'var(--accent)',
+            border: 'none',
+            borderRadius: '50%',
+            width: 32,
+            height: 32,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#fff',
+            cursor: 'pointer',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            fontSize: 14,
+            transition: 'background 0.2s',
+          }}
+          title="Open Workspace Tools (Alt+T)"
+        >
+          ⊞
+        </button>
+      )}
+
       {persona === 'creative' && (
         <div className="flex items-center justify-between" style={{ padding: '7px 16px', borderBottom: '1px solid var(--border)', background: 'var(--bg-surface)' }}>
           <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{storyMode ? 'Story Studio' : 'Creative tools'}</span>
@@ -212,9 +278,33 @@ export function ChatPanel({
           display: 'flex', justifyContent: 'space-between',
           alignItems: 'center', marginTop: 8, padding: '0 4px',
         }}>
-          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-            {model || 'No model selected'}
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              {model || 'No model selected'}
+            </span>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>•</span>
+            <button
+              style={{
+                background: 'none', border: 'none', color: 'var(--text-secondary)',
+                fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3
+              }}
+              onClick={onToggleSidebar}
+              title="Toggle Chats List (Alt+C)"
+            >
+              {sidebarOpen ? '← Hide Chats' : '→ Show Chats'}
+            </button>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>•</span>
+            <button
+              style={{
+                background: 'none', border: 'none', color: 'var(--text-secondary)',
+                fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3
+              }}
+              onClick={onToggleRightPanel}
+              title="Toggle Workspace Tools (Alt+T)"
+            >
+              {rightPanelOpen ? 'Hide Tools →' : 'Show Tools ←'}
+            </button>
+          </div>
           <button
             style={{
               background: 'none', border: 'none', color: 'var(--text-muted)',
