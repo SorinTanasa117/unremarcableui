@@ -15,6 +15,20 @@ export interface SearchResult {
   description: string;
 }
 
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs / 1000}s.`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function getBrowser(): Promise<BrowserContext> {
   if (!browser || !browser.isConnected()) {
     browser = await chromium.launch({
@@ -56,8 +70,9 @@ export async function getBrowser(): Promise<BrowserContext> {
 export async function browseUrl(url: string): Promise<BrowseResult> {
   const ctx = await getBrowser();
   const page = await ctx.newPage();
-  try {
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+
+  const browsePromise = (async () => {
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 18_000 });
     const status = response?.status() ?? 0;
     const text = await page.evaluate(() => {
       const doc = (globalThis as unknown as { document: any }).document;
@@ -66,8 +81,12 @@ export async function browseUrl(url: string): Promise<BrowseResult> {
       return doc.body?.innerText ?? '';
     });
     return { status, url: page.url(), text: text.slice(0, 12_000) };
+  })();
+
+  try {
+    return await withTimeout(browsePromise, 22_000, `Browsing ${url}`);
   } finally {
-    await page.close();
+    await page.close().catch(() => {});
   }
 }
 
