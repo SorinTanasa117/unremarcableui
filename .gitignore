@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.env
+.env.local
+
+# Playwright browser binaries
+/playwright/.local-browsers/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
