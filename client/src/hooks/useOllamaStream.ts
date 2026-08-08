@@ -60,13 +60,13 @@ interface ActiveRunSnapshot {
 
 function activeRunLabel(run: ActiveRunSnapshot, messages: ChatMessage[]): string {
   if (run.partialContent) return run.partialContent;
-  if (!run.hasStartedGenerating) return 'Your AI agent is slowly starting. Please be patient.';
-  if (run.status === 'tool') return `Your AI agent is carrying out the current action: ${run.statusText}`;
+  if (!run.hasStartedGenerating) return 'Starting AI agent…';
+  if (run.status === 'tool') return `Executing action: ${run.statusText}`;
 
   const lastCompletedStep = [...messages].reverse().find((message) => message.role === 'tool_result');
   return lastCompletedStep
-    ? `Your AI agent is reviewing this completed step: ${lastCompletedStep.content}`
-    : 'Your AI agent is starting the requested task.';
+    ? `Reviewing: ${lastCompletedStep.content}`
+    : 'Starting task…';
 }
 
 interface UseOllamaStreamReturn {
@@ -87,15 +87,36 @@ interface UseOllamaStreamReturn {
 
 function uid() { return Math.random().toString(36).slice(2); }
 
-function nextStepLabel(name: string, args?: Record<string, string>): string {
+function toolStartLabel(name: string, args?: Record<string, string>): string {
   const file = args?.filepath;
+  const query = args?.query;
+  const url = args?.url;
+  const cmd = args?.command;
   switch (name) {
-    case 'write_file': return file ? `Next, I'll write \`${file}\`.` : "Next, I'll write a file.";
-    case 'read_file': return file ? `Next, I'll read \`${file}\`.` : "Next, I'll read a file.";
-    case 'web_search': return "Next, I'll search for the needed information.";
-    case 'browse_url': return "Next, I'll inspect the requested page.";
-    case 'run_terminal': return "Next, I'll run a terminal command.";
-    default: return "Next, I'll take the requested action.";
+    case 'write_file': return file ? `Writing file \`${file}\`…` : "Writing a file…";
+    case 'read_file': return file ? `Reading file \`${file}\`…` : "Reading a file…";
+    case 'web_search': return query ? `Searching the web for "${query}"…` : "Searching the web…";
+    case 'browse_url': return url ? `Browsing webpage: ${url}…` : "Browsing webpage…";
+    case 'run_terminal': return cmd ? `Running terminal command \`${cmd}\`…` : "Running terminal command…";
+    default: return `Executing ${name}…`;
+  }
+}
+
+function toolResultProcessingLabel(name: string, args?: Record<string, string>, success = true): string {
+  if (!success) {
+    return `Reviewing failure of **${name}** and adjusting plan…`;
+  }
+  const file = args?.filepath;
+  const query = args?.query;
+  const url = args?.url;
+  const cmd = args?.command;
+  switch (name) {
+    case 'write_file': return file ? `Processing write results for \`${file}\`…` : "Processing file write results…";
+    case 'read_file': return file ? `Processing content read from \`${file}\`…` : "Processing read file content…";
+    case 'web_search': return query ? `Processing web search results for "${query}"…` : "Processing search results…";
+    case 'browse_url': return url ? `Processing browsed content from ${url}…` : "Processing browsed webpage…";
+    case 'run_terminal': return cmd ? `Processing terminal execution results for \`${cmd}\`…` : "Processing terminal output…";
+    default: return `Processing results of ${name}…`;
   }
 }
 
@@ -121,7 +142,7 @@ function savedNextStepLabel(message: any): string | null {
       ? JSON.parse(call.function.arguments)
       : call.function.arguments;
   } catch {}
-  return nextStepLabel(call.function.name, args);
+  return toolStartLabel(call.function.name, args);
 }
 
 function savedToolName(messages: any[], toolIndex: number): string | undefined {
@@ -411,7 +432,7 @@ export function useOllamaStream(): UseOllamaStreamReturn {
     updateSessionMessages(sessionId, (messages) => [...messages, userMsg]);
 
     // Make startup visible instead of showing an unexplained empty cursor.
-    addAssistantBubble('Your AI agent is slowly starting. Please be patient.', true);
+    addAssistantBubble('Starting AI agent…', true);
 
     setStatus('thinking');
     setStatusText('Thinking…');
@@ -465,7 +486,7 @@ export function useOllamaStream(): UseOllamaStreamReturn {
               const currentAssistantId = activeAssistantId.current;
               updateSessionMessages(sessionId, (messages) => messages.map((message) =>
                 message.id === currentAssistantId && message.isActivity
-                  ? { ...message, content: 'Your AI agent is starting. Please be patient.' }
+                  ? { ...message, content: 'Thinking…' }
                   : message
               ));
               setStatus('thinking');
@@ -479,15 +500,15 @@ export function useOllamaStream(): UseOllamaStreamReturn {
 
             case 'tool_start': {
               toolStartTime.current = Date.now();
-              const nextStep = nextStepLabel(data.name, data.args);
               const currentAssistantId = activeAssistantId.current;
+              const descriptiveText = toolStartLabel(data.name, data.args);
               let updatedActivity = false;
               updateSessionMessages(sessionId, (messages) => messages.map((message) => {
                 if (message.id !== currentAssistantId || !message.isActivity) return message;
                 updatedActivity = true;
                 return {
                   ...message,
-                  content: `Your AI agent is ready. ${nextStep}`,
+                  content: descriptiveText,
                   isActivity: false,
                   durationMs: toolStartTime.current - message.timestamp,
                   durationLabel: 'Elapsed',
@@ -497,7 +518,7 @@ export function useOllamaStream(): UseOllamaStreamReturn {
                 updateSessionMessages(sessionId, (messages) => [...messages, {
                   id: uid(),
                   role: 'assistant',
-                  content: `Your AI agent is ready. ${nextStep}`,
+                  content: descriptiveText,
                   timestamp: toolStartTime.current,
                   durationMs: 0,
                   durationLabel: 'Elapsed',
@@ -553,14 +574,13 @@ export function useOllamaStream(): UseOllamaStreamReturn {
                 )
               );
 
+              const currentArgs = activeTool.current?.args;
               setCurrentTool((prev) => prev ? { ...prev, output: data.output, success: data.success } : null);
               activeTool.current = null;
               setStatus('thinking');
-              setStatusText('Processing results…');
+              setStatusText('Thinking…');
               addAssistantBubble(
-                data.success === false
-                  ? `**${data.name}** failed. Your AI agent will use only verified sources and adjust its response.`
-                  : `Completed **${data.name}**. Your AI agent is reviewing the result and preparing the next action.`,
+                toolResultProcessingLabel(data.name, currentArgs, data.success !== false),
                 true,
               );
               break;
