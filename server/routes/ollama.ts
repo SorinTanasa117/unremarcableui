@@ -22,6 +22,9 @@ const MAX_TOOL_CALLS_PER_RUN = 10;
 const MAX_TOOL_FAILURES_PER_RUN = 4;
 const MAX_SEARCH_FAILURES_PER_RUN = 2;
 const SESSIONS_DIR = path.resolve(WORKSPACE_DIR, '.sessions');
+const OLLAMA_FAILURE_LOG_PATH = path.resolve(WORKSPACE_DIR, '.logs', 'ollama-failures.jsonl');
+const MAX_OLLAMA_FAILURE_LOG_BYTES = 512 * 1024;
+let ollamaFailureLogQueue = Promise.resolve();
 interface ModelCapabilities {
   supportsTools: boolean;
   supportsThinking: boolean;
@@ -29,6 +32,52 @@ interface ModelCapabilities {
   systemPromptType?: string;
 }
 const modelCapabilitiesCache = new Map<string, ModelCapabilities>();
+
+function summarizeOllamaMessages(messages: Message[]) {
+  const roleCounts: Record<string, number> = {};
+  let totalContentChars = 0;
+  let assistantToolCallCount = 0;
+  const assistantToolCallNames: string[] = [];
+
+  for (const message of messages) {
+    roleCounts[message.role] = (roleCounts[message.role] ?? 0) + 1;
+    totalContentChars += typeof message.content === 'string' ? message.content.length : 0;
+    if (message.role === 'assistant' && message.tool_calls?.length) {
+      assistantToolCallCount += message.tool_calls.length;
+      for (const toolCall of message.tool_calls) {
+        const name = toolCall.function?.name;
+        if (typeof name === 'string') assistantToolCallNames.push(name);
+      }
+    }
+  }
+
+  return {
+    count: messages.length,
+    roleCounts,
+    totalContentChars,
+    lastRoles: messages.slice(-5).map(message => message.role),
+    assistantToolCallNames: assistantToolCallNames.slice(-5),
+    assistantToolCallCount,
+  };
+}
+
+function appendOllamaFailureLog(entry: Record<string, unknown>): Promise<void> {
+  const task = ollamaFailureLogQueue.then(async () => {
+    await fs.mkdir(path.dirname(OLLAMA_FAILURE_LOG_PATH), { recursive: true });
+    let existing = '';
+    try {
+      existing = await fs.readFile(OLLAMA_FAILURE_LOG_PATH, 'utf-8');
+    } catch {}
+
+    const lines = `${existing}${JSON.stringify(entry)}\n`.split('\n').filter(Boolean);
+    while (Buffer.byteLength(lines.join('\n') + '\n', 'utf-8') > MAX_OLLAMA_FAILURE_LOG_BYTES) {
+      lines.shift();
+    }
+    await fs.writeFile(OLLAMA_FAILURE_LOG_PATH, `${lines.join('\n')}\n`, 'utf-8');
+  });
+  ollamaFailureLogQueue = task.catch(() => undefined);
+  return task.catch(() => undefined);
+}
 
 // Lazy-loaded model map for capability fallback
 let modelMapData: any = null;
@@ -895,6 +944,45 @@ router.post('/chat', async (req: Request, res: Response) => {
   let toolCallCount = 0;
   let toolFailureCount = 0;
   let searchFailureCount = 0;
+  let iterationNumber = 0;
+  let ollamaRequestStartedAt = 0;
+  let currentOllamaPhase: 'ollama_request' | 'ollama_stream' = 'ollama_request';
+  let currentSystemPromptType: string | undefined;
+  let currentAllowTools = false;
+  let lastToolMetadata: { name: string; success: boolean; durationMs: number } | undefined;
+  const recordOllamaFailure = async (
+    phase: 'ollama_http' | 'ollama_stream' | 'ollama_request',
+    error: unknown,
+    response?: { status?: number; statusText?: string }
+  ) => {
+    const detail = error as { name?: string; message?: string; cause?: { message?: string } } | undefined;
+    await appendOllamaFailureLog({
+      timestamp: new Date().toISOString(),
+      sessionId,
+      model,
+      persona: selectedPersona,
+      phase,
+      error: {
+        name: detail?.name || 'Error',
+        message: detail?.message || 'Unknown Ollama error',
+        cause: detail?.cause?.message,
+      },
+      ...(response?.status !== undefined ? { status: response.status } : {}),
+      ...(response?.statusText ? { statusText: response.statusText } : {}),
+      iteration: iterationNumber,
+      toolCallCount,
+      toolFailureCount,
+      searchFailureCount,
+      requestedContext,
+      activeContext: activeContextSize,
+      think: Boolean(think),
+      allowTools: currentAllowTools,
+      systemPromptType: currentSystemPromptType ?? null,
+      elapsedMs: ollamaRequestStartedAt ? Date.now() - ollamaRequestStartedAt : null,
+      messageSummary: summarizeOllamaMessages(requestCtx.getMessages()),
+      lastTool: lastToolMetadata ?? null,
+    });
+  };
   const saveProgress = async (partialContent: string, force = false) => {
     const run = activeRuns.get(sessionId);
     if (!run) return;
@@ -916,11 +1004,14 @@ router.post('/chat', async (req: Request, res: Response) => {
     let forceFinalResponse = false;
     let finalResponseRetryCount = 0;
     while (iterating && !ac.signal.aborted) {
+      iterationNumber += 1;
       const capabilities = await getModelCapabilities(model, ac.signal);
       const activeContext = activeContextSize;
       // Creative Mode is intentionally prose-only. Completion-only GGUFs also
       // reject tool-role messages and assistant tool calls from old sessions.
       const allowTools = !forceFinalResponse && !isolated && selectedPersona !== 'creative' && capabilities.supportsTools;
+      currentSystemPromptType = capabilities.systemPromptType;
+      currentAllowTools = allowTools;
       const modelMessages = forceFinalResponse
         ? [...requestCtx.getMessages(), {
           role: 'system' as const,
@@ -972,9 +1063,12 @@ router.post('/chat', async (req: Request, res: Response) => {
         ...(allowTools ? { tools: activeToolDefs } : {}),
       };
 
+      ollamaRequestStartedAt = Date.now();
+      currentOllamaPhase = 'ollama_request';
       const ollamaResp = await fetchOllamaChat(body, ac.signal);
 
       if (!ollamaResp.ok) {
+        await recordOllamaFailure('ollama_http', new Error('Ollama returned a non-OK response'), ollamaResp);
         const detail = await ollamaResp.text();
         // A model may have been removed after this chat was saved. Clear its
         // persisted selection so reopening the chat cannot keep retrying it.
@@ -985,6 +1079,7 @@ router.post('/chat', async (req: Request, res: Response) => {
         break;
       }
 
+      currentOllamaPhase = 'ollama_stream';
       let assistantContent = '';
       let assistantThinking = '';
       const pendingToolCalls: any[] = [];
@@ -1171,6 +1266,7 @@ router.post('/chat', async (req: Request, res: Response) => {
             toolFailureCount += 1;
             if (toolName === 'web_search') searchFailureCount += 1;
           }
+          lastToolMetadata = { name: toolName, success: result.success, durationMs: toolDurationMs };
 
           let toolOutput = result.output;
           if (toolName === 'browse_url' && result.success && selectedPersona === 'researcher') {
@@ -1225,6 +1321,7 @@ router.post('/chat', async (req: Request, res: Response) => {
   } catch (err: any) {
     if (err.name !== 'AbortError') {
       const detail = err.cause?.message || err.message || 'Unknown Ollama connection error';
+      await recordOllamaFailure(currentOllamaPhase, err);
       console.error(`[Ollama chat] ${model} failed:`, detail);
       send('error', { message: `Ollama request failed: ${detail}` });
     } else {
