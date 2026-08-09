@@ -26,8 +26,23 @@ interface ModelCapabilities {
   supportsTools: boolean;
   supportsThinking: boolean;
   contextLength?: number;
+  systemPromptType?: string;
 }
 const modelCapabilitiesCache = new Map<string, ModelCapabilities>();
+
+// Lazy-loaded model map for capability fallback
+let modelMapData: any = null;
+async function getModelMap(): Promise<any> {
+  if (modelMapData) return modelMapData;
+  try {
+    const filePath = path.resolve(WORKSPACE_DIR, '../model_map.json');
+    const content = await fs.readFile(filePath, 'utf-8');
+    modelMapData = JSON.parse(content);
+    return modelMapData;
+  } catch {
+    return null;
+  }
+}
 
 // Ensure sessions directory exists
 await fs.mkdir(SESSIONS_DIR, { recursive: true });
@@ -320,6 +335,16 @@ async function getModelCapabilities(model: string, signal: AbortSignal): Promise
   const cached = modelCapabilitiesCache.get(model);
   if (cached !== undefined) return cached;
 
+  // Use model_map.json as a baseline / fallback for capability detection.
+  // Ollama's /api/show only reports capabilities for models it explicitly tags;
+  // many GGUF models have tool-call support but Ollama does not list it.
+  const modelMap = await getModelMap();
+  const mapDef = modelMap?.models?.find((m: any) => m.id === model);
+  const mapSupportsTools = mapDef?.capabilities?.function_calling === true;
+  const mapSupportsThinking = mapDef?.capabilities?.thinking_mode === true;
+  const mapContextLength: number | undefined = mapDef?.max_context;
+  const mapSystemPromptType: string | undefined = mapDef?.system_prompt_type;
+
   try {
     const response = await fetch(`${OLLAMA_URL}/api/show`, {
       method: 'POST',
@@ -327,22 +352,61 @@ async function getModelCapabilities(model: string, signal: AbortSignal): Promise
       body: JSON.stringify({ name: model }),
       signal,
     });
-    if (!response.ok) return { supportsTools: false, supportsThinking: false };
+    if (!response.ok) {
+      const capabilities = {
+        supportsTools: mapSupportsTools,
+        supportsThinking: mapSupportsThinking,
+        contextLength: mapContextLength,
+        systemPromptType: mapSystemPromptType,
+      };
+      modelCapabilitiesCache.set(model, capabilities);
+      return capabilities;
+    }
     const data = await response.json() as {
       capabilities?: string[];
       model_info?: Record<string, number>;
     };
     const capabilities = {
-      supportsTools: data.capabilities?.includes('tools') ?? false,
-      supportsThinking: data.capabilities?.includes('thinking') ?? false,
-      contextLength: data.model_info?.['llama.context_length'],
+      // OR Ollama's report with model_map so either source can enable tools
+      supportsTools: (data.capabilities?.includes('tools') ?? false) || mapSupportsTools,
+      supportsThinking: (data.capabilities?.includes('thinking') ?? false) || mapSupportsThinking,
+      // Prefer Ollama's value; fall back to model_map max_context
+      contextLength: data.model_info?.['llama.context_length'] ?? mapContextLength,
+      systemPromptType: mapSystemPromptType,
     };
     modelCapabilitiesCache.set(model, capabilities);
     return capabilities;
   } catch (error: any) {
     if (error.name === 'AbortError') throw error;
-    return { supportsTools: false, supportsThinking: false };
+    const capabilities = {
+      supportsTools: mapSupportsTools,
+      supportsThinking: mapSupportsThinking,
+      contextLength: mapContextLength,
+      systemPromptType: mapSystemPromptType,
+    };
+    modelCapabilitiesCache.set(model, capabilities);
+    return capabilities;
   }
+}
+
+function normalizeOllamaMessages(messages: Message[], systemPromptType?: string): Message[] {
+  if (systemPromptType?.toLowerCase() !== 'mistral') return messages;
+
+  const systemContent = messages
+    .filter((message) => message.role === 'system')
+    .map((message) => message.content)
+    .join('\n\n');
+  if (!systemContent) return messages;
+
+  const nonSystemMessages = messages.filter((message) => message.role !== 'system');
+  const firstUserIndex = nonSystemMessages.findIndex((message) => message.role === 'user');
+  if (firstUserIndex < 0) {
+    return [{ role: 'user', content: systemContent }, ...nonSystemMessages];
+  }
+
+  return nonSystemMessages.map((message, index) => index === firstUserIndex
+      ? { ...message, content: `${systemContent}\n\n${message.content}` }
+      : message);
 }
 
 // Default persona fallbacks in case file read fails
@@ -378,7 +442,7 @@ async function getPersonaPrompt(personaKey: string): Promise<string> {
     if (personaKey === 'creative') {
       rule = '\n\nResponse rule: Begin directly with the requested final answer. Creative Mode is prose-only: write the requested text in the chat response. Never call tools, write files, read files, or describe file operations.';
     } else {
-      rule = '\n\nResponse rule: Think step-by-step before executing tools or providing the final answer. If you support reasoning/thinking, format your internal thoughts inside <think>...</think> tags.';
+      rule = '\n\nTool-use mandate: You MUST use the provided tools (write_file, run_terminal, read_file) to perform all file and command operations. NEVER describe, narrate, or simulate writing a file or running a command in plain text — always emit the actual tool call. If you support reasoning/thinking, place internal planning inside <think>...</think> tags; your visible response must contain only tool calls and brief status lines.';
     }
     return `${persona}${rule}`;
   } catch (err) {
@@ -387,7 +451,7 @@ async function getPersonaPrompt(personaKey: string): Promise<string> {
     if (personaKey === 'creative') {
       rule = '\n\nResponse rule: Begin directly with the requested final answer. Creative Mode is prose-only: write the requested text in the chat response. Never call tools, write files, read files, or describe file operations.';
     } else {
-      rule = '\n\nResponse rule: Think step-by-step before executing tools or providing the final answer. If you support reasoning/thinking, format your internal thoughts inside <think>...</think> tags.';
+      rule = '\n\nTool-use mandate: You MUST use the provided tools (write_file, run_terminal, read_file) to perform all file and command operations. NEVER describe, narrate, or simulate writing a file or running a command in plain text — always emit the actual tool call. If you support reasoning/thinking, place internal planning inside <think>...</think> tags; your visible response must contain only tool calls and brief status lines.';
     }
     return `${persona}${rule}`;
   }
@@ -640,7 +704,7 @@ router.get('/tokens', async (req: Request, res: Response) => {
 
 // POST /api/ollama/chat
 router.post('/chat', async (req: Request, res: Response) => {
-  const { sessionId, model, message, pendingBrowse, persona, isolated, numCtx, think } = req.body as {
+  const { sessionId, model, message, pendingBrowse, persona, isolated, numCtx, think, caveman } = req.body as {
     sessionId: string;
     model: string;
     message?: string;
@@ -649,6 +713,7 @@ router.post('/chat', async (req: Request, res: Response) => {
     isolated?: boolean;
     numCtx?: number;
     think?: boolean;
+    caveman?: boolean;
   };
 
   const selectedPersona = persona || 'coder';
@@ -671,9 +736,13 @@ router.post('/chat', async (req: Request, res: Response) => {
   // Research runs repeatedly feed source material back to the model. A 32k
   // context is ample for the bounded source budget and avoids huge CPU KV
   // caches (the UI can otherwise request 131k+).
+  // Cap context to the model's actual max_context to avoid sending Ollama a
+  // larger KV cache than the GGUF was quantised for, which degrades quality.
+  const capCaps = await getModelCapabilities(model, new AbortController().signal);
+  const modelMaxContext = capCaps.contextLength ?? OLLAMA_NUM_CTX;
   const activeContextSize = selectedPersona === 'researcher'
-    ? Math.min(requestedContext, 32_768)
-    : requestedContext;
+    ? Math.min(requestedContext, 32_768, modelMaxContext)
+    : Math.min(requestedContext, modelMaxContext);
   const { ctx } = await getCtx(sessionId, selectedPersona);
   // Story requests include their own compact continuity packet. Their full
   // exchange is still retained in the session, but never reused as inference
@@ -773,16 +842,45 @@ router.post('/chat', async (req: Request, res: Response) => {
           : requestCtx.getMessages()
             .filter((message) => message.role !== 'tool')
             .map(({ tool_calls, ...message }) => message);
+
+      // (1) swap in shrunk tool descriptions to save input tokens (caveman-shrink concept)
+      // (2) append a system directive that compresses prose output, while
+      //     still allowing one-line status lines between tool calls so the UI
+      //     user can see "ran weblink check on www.example.com — 4 hits." etc.
+      const CAVEMAN_TOOL_DEFINITIONS = [
+        { type: 'function', function: { name: 'web_search',   description: 'DuckDuckGo search. Returns results.',        parameters: { type: 'object', properties: { query:    { type: 'string' } }, required: ['query'] } } },
+        { type: 'function', function: { name: 'browse_url',   description: 'Fetch URL. Returns page text.',               parameters: { type: 'object', properties: { url:      { type: 'string' } }, required: ['url'] } } },
+        { type: 'function', function: { name: 'write_file',   description: 'Write file to agent-workspace.',              parameters: { type: 'object', properties: { filepath: { type: 'string' }, content: { type: 'string' } }, required: ['filepath', 'content'] } } },
+        { type: 'function', function: { name: 'read_file',    description: 'Read file from agent-workspace.',             parameters: { type: 'object', properties: { filepath: { type: 'string' } }, required: ['filepath'] } } },
+        { type: 'function', function: { name: 'run_terminal', description: 'Run shell command in agent-workspace.',        parameters: { type: 'object', properties: { command:  { type: 'string' } }, required: ['command'] } } },
+      ];
+
+      const CAVEMAN_DIRECTIVE = [
+        'Respond terse like smart caveman. All technical substance stay. Only fluff die.',
+        'Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging.',
+        'Fragments OK. Short synonyms preferred. No decorative tables/emoji.',
+        'Never drop: not/never/no/only/except. Numbers exact. Technical terms exact. Code blocks unchanged. Errors quoted exact.',
+        'Tool calls: fire direct. After every tool result, emit ONE short status line (single sentence, <120 chars) before the next call or final answer — e.g. "Ran weblink check on www.example.com — 4 hits." or "Read repo/notes.md, 312 lines." Then proceed immediately.',
+        'No preamble, no plan recap, no apologies, no hedging. Text before a call only to: clarify ambiguity, warn security/irreversible risk.',
+        'Pattern between calls: [short status line] [next tool call OR final answer].',
+      ].join('\n');
+
+      if (caveman) {
+        modelMessages.push({ role: 'system' as const, content: CAVEMAN_DIRECTIVE });
+      }
+
+      const normalizedMessages = normalizeOllamaMessages(modelMessages, capabilities.systemPromptType);
+      const activeToolDefs = caveman ? CAVEMAN_TOOL_DEFINITIONS : TOOL_DEFINITIONS;
       const body = {
         model,
-        messages: modelMessages,
+        messages: normalizedMessages,
         stream: true,
         // Supported by current Ollama releases; prevents models with optional
         // reasoning from spending their visible response on a hidden plan.
         think: Boolean(think),
         options: { num_ctx: activeContext },
         keep_alive: OLLAMA_KEEP_ALIVE,
-        ...(allowTools ? { tools: TOOL_DEFINITIONS } : {}),
+        ...(allowTools ? { tools: activeToolDefs } : {}),
       };
 
       const ollamaResp = await fetchOllamaChat(body, ac.signal);

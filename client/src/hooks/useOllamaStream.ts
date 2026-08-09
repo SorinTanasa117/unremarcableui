@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import { TokenRateTracker } from '../lib/tokenCounter';
 
 export type MessageRole = 'user' | 'assistant' | 'tool_result' | 'system';
 
@@ -37,6 +38,15 @@ export interface TokenUsage {
   total: number;
 }
 
+export interface TokenRates {
+  /** Prompt prefill (input) tokens per second over the active window. */
+  read: number;
+  /** Output generation (decoded) tokens per second over the active window. */
+  write: number;
+  /** True while cumulative input or output counts have moved within the window. */
+  active: boolean;
+}
+
 export interface SessionLoadResult {
   persona: string;
   model: string;
@@ -47,6 +57,8 @@ export interface SendMessageOptions {
   isolated?: boolean;
   numCtx?: number;
   think?: boolean;
+  /** Caveman mode — compress every reply, same technical content, fewer tokens. */
+  caveman?: boolean;
 }
 
 interface ActiveRunSnapshot {
@@ -74,6 +86,7 @@ interface UseOllamaStreamReturn {
   status: AgentStatus;
   statusText: string;
   tokenUsage: TokenUsage;
+  tokenRates: TokenRates;
   sendMessage: (content: string, model: string, sessionId: string, persona: string, options?: SendMessageOptions) => void;
   stop: (sessionId: string) => void;
   killModel: (model: string) => Promise<void>;
@@ -179,6 +192,7 @@ export function useOllamaStream(): UseOllamaStreamReturn {
   const [streamStatusText, setStatusText] = useState('');
   const [visibleSessionId, setVisibleSessionId] = useState('');
   const [tokenUsage, setTokenUsage] = useState<TokenUsage>({ input: 0, output: 0, total: 0 });
+  const [tokenRates, setTokenRates] = useState<TokenRates>({ read: 0, write: 0, active: false });
   const [currentTool, setCurrentTool] = useState<ToolEvent | null>(null);
   const [sessionsList, setSessionsList] = useState<ChatSessionInfo[]>([]);
   const abortRef = useRef<(() => void) | null>(null);
@@ -195,6 +209,12 @@ export function useOllamaStream(): UseOllamaStreamReturn {
   const messagesBySession = useRef(new Map<string, ChatMessage[]>());
   const tokensBySession = useRef(new Map<string, TokenUsage>());
 
+  // Token-rate tracking. The server emits a `tokens` event after each streamed
+  // chunk. We record (timestamp, input, output) and compute read (prefill) and
+  // write (decode) speeds over a recent sliding window so the top-bar readout
+  // stays smooth even when the underlying SSE event cadence is bursty.
+  const rateTrackerRef = useRef<TokenRateTracker>(new TokenRateTracker());
+
   const status = streamSessionId.current === visibleSessionId ? streamStatus : 'idle';
   const statusText = streamSessionId.current === visibleSessionId ? streamStatusText : '';
 
@@ -207,6 +227,40 @@ export function useOllamaStream(): UseOllamaStreamReturn {
   const updateSessionTokens = useCallback((sessionId: string, usage: TokenUsage) => {
     tokensBySession.current.set(sessionId, usage);
     if (visibleSessionRef.current === sessionId) setTokenUsage(usage);
+    // Only sample live rates for the active streaming session so a hydrated
+    // history load doesn't pollute the in-flight measurement window.
+    if (streamSessionId.current === sessionId) {
+      const rates = rateTrackerRef.current.record(Date.now(), usage.input, usage.output);
+      if (visibleSessionRef.current === sessionId) {
+        setTokenRates((current) => (
+          current.read === rates.read && current.write === rates.write && current.active === rates.active
+            ? current
+            : rates
+        ));
+      }
+    }
+  }, []);
+
+  const resetTokenRates = useCallback(() => {
+    rateTrackerRef.current.reset();
+    setTokenRates({ read: 0, write: 0, active: false });
+  }, []);
+
+  // Tick once a second so the displayed rate stays fresh between SSE
+  // `tokens` events (which arrive at most once per chunk). The tracker
+  // already updates instantly on each event, so this only repaints when a
+  // long gap would otherwise freeze the readout.
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      if (streamSessionId.current !== visibleSessionRef.current) return;
+      const rates = rateTrackerRef.current.rates();
+      setTokenRates((current) => (
+        current.read === rates.read && current.write === rates.write && current.active === rates.active
+          ? current
+          : rates
+      ));
+    }, 500);
+    return () => window.clearInterval(intervalId);
   }, []);
 
   const appendToken = useCallback((token: string) => {
@@ -424,8 +478,20 @@ export function useOllamaStream(): UseOllamaStreamReturn {
     // must not replace it with another session's messages or counters.
     sessionLoadVersion.current += 1;
     const start = Date.now();
+    // The initial history request can still be pending when the user sends
+    // the first prompt. Claim the view before appending so that prompt is not
+    // stored only in the per-session cache while the visible session ref is
+    // still empty.
+    visibleSessionRef.current = sessionId;
+    setVisibleSessionId(sessionId);
     streamSessionId.current = sessionId;
     exchangeStartTime.current = start;
+
+    // Reset rate tracking so the first SSE `tokens` event establishes a fresh
+    // baseline. A pre-seeded readout would divide the entire session's
+    // accumulated tokens by a tiny elapsed window and produce a huge burst.
+    rateTrackerRef.current.start(start);
+    setTokenRates({ read: 0, write: 0, active: false });
 
     // Add user bubble
     const userMsg: ChatMessage = { id: uid(), role: 'user', content, timestamp: start };
@@ -445,7 +511,7 @@ export function useOllamaStream(): UseOllamaStreamReturn {
       const res = await fetch('/api/ollama/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId, model, message: content, persona, isolated: options.isolated, numCtx: options.numCtx, think: options.think }),
+        body: JSON.stringify({ sessionId, model, message: content, persona, isolated: options.isolated, numCtx: options.numCtx, think: options.think, caveman: options.caveman }),
         signal: controller.signal,
       });
 
@@ -602,6 +668,7 @@ export function useOllamaStream(): UseOllamaStreamReturn {
               streamSessionId.current = null;
               setCurrentTool(null);
               activeAssistantId.current = '';
+              resetTokenRates();
               fetchSessionsList();
               break;
             }
@@ -611,12 +678,14 @@ export function useOllamaStream(): UseOllamaStreamReturn {
               setStatusText('Stopped');
               setCurrentTool(null);
               activeAssistantId.current = '';
+              resetTokenRates();
               break;
 
             case 'error':
               setStatus('error');
               setStatusText(data.message ?? 'Error');
               activeAssistantId.current = '';
+              resetTokenRates();
               updateSessionMessages(sessionId, (messages) => [...messages, {
                 id: uid(), role: 'system',
                 content: `⚠️ Error: ${data.message}`,
@@ -635,11 +704,12 @@ export function useOllamaStream(): UseOllamaStreamReturn {
         setStatusText('Stopped');
       }
       activeAssistantId.current = '';
+      resetTokenRates();
       updateSessionMessages(sessionId, (messages) => [...messages, {
         id: uid(), role: 'system', content: `⚠️ Error: ${err.message}`, timestamp: Date.now(),
       }]);
     }
-  }, [appendToken, addAssistantBubble, fetchSessionsList, updateSessionMessages, updateSessionTokens]);
+  }, [appendToken, addAssistantBubble, fetchSessionsList, updateSessionMessages, updateSessionTokens, resetTokenRates]);
 
   const stop = useCallback(async (sessionId: string) => {
     if (streamSessionId.current !== sessionId) return;
@@ -651,7 +721,8 @@ export function useOllamaStream(): UseOllamaStreamReturn {
     }).catch(() => {});
     setStatus('stopped');
     setStatusText('Stopped');
-  }, []);
+    resetTokenRates();
+  }, [resetTokenRates]);
 
   const killModel = useCallback(async (model: string) => {
     if (!model) return;
@@ -664,11 +735,12 @@ export function useOllamaStream(): UseOllamaStreamReturn {
       if (!res.ok) throw new Error(`Unable to unload model (${res.status})`);
       setStatus('stopped');
       setStatusText('Model unloaded');
+      resetTokenRates();
     } catch (err: any) {
       setStatus('error');
       setStatusText(err.message);
     }
-  }, []);
+  }, [resetTokenRates]);
 
   const resetSession = useCallback(async (sessionId: string) => {
     await fetch('/api/ollama/reset', {
@@ -684,14 +756,16 @@ export function useOllamaStream(): UseOllamaStreamReturn {
     setTokenUsage({ input: 0, output: 0, total: 0 });
     setCurrentTool(null);
     activeAssistantId.current = '';
+    resetTokenRates();
     await fetchSessionsList();
-  }, [fetchSessionsList]);
+  }, [fetchSessionsList, resetTokenRates]);
 
   return {
     messages,
     status,
     statusText,
     tokenUsage,
+    tokenRates,
     sendMessage,
     stop,
     killModel,

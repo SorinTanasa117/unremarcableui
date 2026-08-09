@@ -7,6 +7,7 @@ import { ModelSelector } from './components/ModelSelector';
 import { StatusIndicator } from './components/StatusIndicator';
 import { ProgressBar } from './components/ProgressBar';
 import { useOllamaStream } from './hooks/useOllamaStream';
+import { formatTokenRate } from './lib/tokenCounter';
 
 function generateSessionId() {
   return `session_${Math.random().toString(36).slice(2, 11)}`;
@@ -28,6 +29,7 @@ export default function App() {
     status,
     statusText,
     tokenUsage,
+    tokenRates,
     sendMessage,
     stop,
     killModel,
@@ -41,6 +43,7 @@ export default function App() {
   const [model, setModel] = useState('');
   const [contextSize, setContextSize] = useState(() => Number(localStorage.getItem('ollama_context_size')) || 32_768);
   const [thinkingMode, setThinkingMode] = useState(false);
+  const [cavemanMode, setCavemanMode] = useState(() => localStorage.getItem('ollama_caveman_mode') === 'true');
   const [modelMap, setModelMap] = useState<any>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [folderOpenState, setFolderOpenState] = useState<Record<string, boolean>>({});
@@ -53,12 +56,27 @@ export default function App() {
       .catch((err) => console.error('Failed to load model map:', err));
   }, []);
 
-  // Automatically turn off thinking mode if the selected model does not support it
+  // Sync thinking mode and context size with the selected model's capabilities
   useEffect(() => {
     if (!modelMap || !model) return;
     const currentModelDef = modelMap.models?.find((m: any) => m.id === model);
-    if (currentModelDef && !currentModelDef.capabilities?.thinking_mode) {
+    if (!currentModelDef) return;
+
+    // ── Thinking mode ──────────────────────────────────────────────────────
+    if (!currentModelDef.capabilities?.thinking_mode) {
+      // Model does not support thinking at all — turn it off
       setThinkingMode(false);
+    } else if (currentModelDef.thinking_config?.default_enabled === true) {
+      // Model prefers thinking on by default (e.g. Laguna XS, Nemotron)
+      setThinkingMode(true);
+    }
+
+    // ── Context size ────────────────────────────────────────────────────────
+    // Always default to the highest valid CONTEXT_SIZES step the model supports.
+    const modelMax: number | undefined = currentModelDef.max_context;
+    if (modelMax) {
+      const best = [...CONTEXT_SIZES].reverse().find((s) => s <= modelMax);
+      if (best) setContextSize(best);
     }
   }, [model, modelMap]);
 
@@ -104,6 +122,10 @@ export default function App() {
     localStorage.setItem('ollama_context_size', String(contextSize));
   }, [contextSize]);
 
+  useEffect(() => {
+    localStorage.setItem('ollama_caveman_mode', String(cavemanMode));
+  }, [cavemanMode]);
+
   // Load selected session history and restore its active persona and model.
   useEffect(() => {
     let cancelled = false;
@@ -113,7 +135,7 @@ export default function App() {
     loadSessionHistory(activeSessionId).then((session) => {
       if (!cancelled) {
         setActivePersona(requestedPersona ?? session.persona as PersonaType);
-        setModel(requestedModel ?? session.model);
+        setModel((current) => requestedModel || session.model || current);
         if (requestedPersona) newSessionPersonas.current.delete(activeSessionId);
         if (requestedModel !== undefined) newSessionModels.current.delete(activeSessionId);
       }
@@ -181,19 +203,55 @@ export default function App() {
         {/* Model selector */}
         <ModelSelector value={model} onChange={setModel} disabled={isRunning} persona={activePersona} />
 
+        {(() => {
+          const currentModelDef = modelMap?.models?.find((m: any) => m.id === model);
+          const modelMax: number | undefined = currentModelDef?.max_context;
+          const allowedSizes = modelMax
+            ? CONTEXT_SIZES.filter((s) => s <= modelMax)
+            : CONTEXT_SIZES;
+          return (
+            <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Context</span>
+              <select
+                value={contextSize}
+                onChange={(event) => setContextSize(Number(event.target.value))}
+                disabled={isRunning}
+                title="Context window used for the next model run"
+                style={{ padding: '5px 8px', fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}
+              >
+                {allowedSizes.map((size) => <option key={size} value={size}>{size / 1024}k</option>)}
+              </select>
+            </div>
+          );
+        })()}
+
+
+        {/* Persona selector — placed right after context, before the toggles */}
         <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
-          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Context</span>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Persona</span>
           <select
-            value={contextSize}
-            onChange={(event) => setContextSize(Number(event.target.value))}
-            disabled={isRunning}
-            title="Context window used for the next model run"
-            style={{ padding: '5px 8px', fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}
+            id="persona-selector"
+            value={activePersona}
+            onChange={(e) => setActivePersona(e.target.value as PersonaType)}
+            disabled={isRunning || messages.length > 0}
+            style={{
+              padding: '5px 10px',
+              fontSize: 12,
+              background: 'var(--bg-card)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-md)',
+              color: 'var(--text-primary)',
+              cursor: messages.length > 0 ? 'not-allowed' : 'pointer',
+            }}
+            title={messages.length > 0 ? "Reset conversation to change persona" : "Select AI Agent Persona"}
           >
-            {CONTEXT_SIZES.map((size) => <option key={size} value={size}>{size / 1024}k</option>)}
+            <option value="coder">💻 Coder</option>
+            <option value="researcher">🔍 Researcher</option>
+            <option value="creative">✍ Creative Novelist</option>
           </select>
         </div>
 
+        {/* Thinking mode toggle */}
         {(() => {
           const selectedModelDef = modelMap?.models?.find((m: any) => m.id === model);
           const supportsThinking = selectedModelDef ? (selectedModelDef.capabilities?.thinking_mode ?? false) : true;
@@ -219,178 +277,205 @@ export default function App() {
           );
         })()}
 
-        {/* Persona selector */}
-        <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
-          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Persona</span>
-          <select
-            id="persona-selector"
-            value={activePersona}
-            onChange={(e) => setActivePersona(e.target.value as PersonaType)}
-            disabled={isRunning || messages.length > 0} // lock persona once conversation starts
-            style={{
-              padding: '5px 10px',
-              fontSize: 12,
-              background: 'var(--bg-card)',
-              border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-md)',
-              color: 'var(--text-primary)',
-              cursor: messages.length > 0 ? 'not-allowed' : 'pointer',
-            }}
-            title={messages.length > 0 ? "Reset conversation to change persona" : "Select AI Agent Persona"}
-          >
-            <option value="coder">💻 Coder</option>
-            <option value="researcher">🔍 Researcher</option>
-            <option value="creative">✍ Creative Novelist</option>
-          </select>
+        {/* Caveman mode toggle */}
+        <label
+          className="flex items-center gap-2"
+          style={{
+            fontSize: 12,
+            color: cavemanMode ? 'var(--amber, #f59e0b)' : 'var(--text-secondary)',
+            cursor: isRunning ? 'not-allowed' : 'pointer',
+            opacity: isRunning ? 0.5 : 1,
+            transition: 'color 0.2s',
+          }}
+          title="Caveman mode — same answers, 65% fewer output tokens. Drops filler words and pleasantries, keeps full technical accuracy."
+        >
+          <input
+            type="checkbox"
+            checked={cavemanMode}
+            onChange={(e) => setCavemanMode(e.target.checked)}
+            disabled={isRunning}
+          />
+          🪨 Caveman
+        </label>
+
+        {/* Spacer — pushes token bar to the right */}
+        <div style={{ flex: 1 }} />
+
+        {/* Token bar with Context label, plus live read/write token speeds */}
+        <div
+          className="flex items-stretch gap-2"
+          style={{
+            borderLeft: '1px solid var(--border)',
+            paddingLeft: 12,
+            minWidth: 240,
+          }}
+        >
+          <div className="flex flex-col justify-center" style={{ gap: 1 }}>
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>Context</span>
+            <div
+              className="flex items-center"
+              style={{ gap: 10, fontSize: 10.5, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}
+              title="Live prompt prefill (read) and token generation (write) throughput, computed from the last 8 SSE token-counter samples."
+            >
+              <span style={{ color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                👁 <span style={{ color: 'var(--text-muted)' }}>Read</span>
+                <span style={{ color: tokenRates.read > 0 ? 'var(--cyan)' : 'var(--text-muted)' }}>
+                  {formatTokenRate(tokenRates.read)} t/s
+                </span>
+              </span>
+              <span style={{ color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                ⌨ <span style={{ color: 'var(--text-muted)' }}>Write</span>
+                <span style={{ color: tokenRates.write > 0 ? 'var(--accent-light)' : 'var(--text-muted)' }}>
+                  {formatTokenRate(tokenRates.write)} t/s
+                </span>
+              </span>
+            </div>
+          </div>
+          <ProgressBar input={tokenUsage.input} output={tokenUsage.output} />
         </div>
 
-        {/* Status */}
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'center' }}>
-          <StatusIndicator status={status} statusText={statusText} />
-        </div>
 
-        {/* Token bar */}
-        <ProgressBar input={tokenUsage.input} output={tokenUsage.output} />
-
-        {/* Layout controls */}
-        <div className="flex items-center gap-1" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12, marginLeft: 4 }}>
-          {/* Toggle Left Sidebar */}
-          <button
-            className="btn"
-            style={{
-              padding: '5px 10px',
-              fontSize: 12,
-              background: sidebarOpen ? 'var(--accent-glow)' : 'transparent',
-              borderColor: sidebarOpen ? 'var(--accent)' : 'var(--border)',
-              color: sidebarOpen ? 'var(--accent-light)' : 'var(--text-secondary)',
-            }}
-            onClick={() => setSidebarOpen((o) => !o)}
-            title="Toggle Chats List"
-          >
-            💬 Chats
-          </button>
-
-          {/* Toggle Right Panel */}
-          <button
-            className="btn"
-            style={{
-              padding: '5px 10px',
-              fontSize: 12,
-              background: rightPanelOpen ? 'var(--accent-glow)' : 'transparent',
-              borderColor: rightPanelOpen ? 'var(--accent)' : 'var(--border)',
-              color: rightPanelOpen ? 'var(--accent-light)' : 'var(--text-secondary)',
-            }}
-            onClick={() => setRightPanelOpen((o) => !o)}
-            title="Toggle Workspace Tools"
-          >
-            ⊞ Workspace Tools
-          </button>
-        </div>
       </header>
 
       {/* ── Main Body ── */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
 
-        {/* Left Sidebar — Collapsible Chats Tabs List */}
-        {sidebarOpen && (
-          <aside style={{
-            width: 230,
-            flexShrink: 0,
-            borderRight: '1px solid var(--border)',
-            display: 'flex',
-            flexDirection: 'column',
-            background: 'var(--bg-surface)',
-            overflow: 'hidden',
-          }}>
-            {/* New Chat Button (split with persona selectors) */}
-            <div style={{ padding: 12, borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <button
-                className="btn btn-primary"
-                style={{ width: '100%', justifyContent: 'center' }}
-                onClick={() => startNewChat(activePersona)}
-              >
-                + New Chat
-              </button>
-              <div style={{ display: 'flex', gap: 4, width: '100%' }}>
-                {(['coder', 'researcher', 'creative'] as const).map((p) => (
-                  <button
-                    key={p}
-                    onClick={() => startNewChat(p)}
-                    style={{
-                      flex: 1,
-                      padding: '4px',
-                      fontSize: '10px',
-                      border: '1px solid var(--border)',
-                      borderRadius: 'var(--radius-sm)',
-                      background: 'var(--bg-card)',
-                      color: 'var(--text-secondary)',
-                      cursor: 'pointer',
-                    }}
-                    title={`Create new ${p} chat`}
-                  >
-                    {p === 'coder' && '💻'}
-                    {p === 'researcher' && '🔍'}
-                    {p === 'creative' && '✍'}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* List of chat sessions */}
-            <div className="flex-1 overflow-auto" style={{ padding: '8px 6px', display: 'flex', flexDirection: 'column', gap: 2 }}>
-              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', paddingLeft: 8, paddingBottom: 6, letterSpacing: '0.08em' }}>
-                Recent Chats
-              </div>
-              {sessionsList.length === 0 && (
-                <div style={{ padding: 12, color: 'var(--text-muted)', fontSize: 11, textAlign: 'center' }}>
-                  No past chats
-                </div>
-              )}
-              {sessionsList.map((s) => {
-                const isActive = s.sessionId === activeSessionId;
-                const badge = personaBadges[s.persona as PersonaType] || { label: 'Agent', color: 'var(--text-muted)' };
-                return (
-                  <div
-                    key={s.sessionId}
-                    onClick={() => setActiveSessionId(s.sessionId)}
-                    className="flex items-center justify-between"
-                    style={{
-                      padding: '8px 10px',
-                      borderRadius: 'var(--radius-md)',
-                      background: isActive ? 'var(--accent-glow)' : 'transparent',
-                      color: isActive ? 'var(--accent-light)' : 'var(--text-primary)',
-                      cursor: 'pointer',
-                      fontSize: 12.5,
-                      transition: 'background 0.15s',
-                    }}
-                    onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = 'var(--bg-hover)'; }}
-                    onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
-                  >
-                    <div className="flex flex-col flex-1 truncate" style={{ marginRight: 6 }}>
-                      <span className="truncate" style={{ fontWeight: 500 }}>
-                        {s.title}
-                      </span>
-                      <span style={{ fontSize: 9, color: badge.color, marginTop: 2, display: 'inline-block' }}>
-                        {badge.label}
-                      </span>
-                    </div>
+        {/* Left Sidebar — always present; collapse tab on its right edge */}
+        <div style={{
+          display: 'flex',
+          flexShrink: 0,
+          position: 'relative',
+        }}>
+          {/* Sidebar content */}
+          {sidebarOpen && (
+            <aside style={{
+              width: 230,
+              display: 'flex',
+              flexDirection: 'column',
+              borderRight: '1px solid var(--border)',
+              background: 'var(--bg-surface)',
+              overflow: 'hidden',
+            }}>
+              {/* New Chat Button (split with persona selectors) */}
+              <div style={{ padding: 12, borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <button
+                  className="btn btn-primary"
+                  style={{ width: '100%', justifyContent: 'center' }}
+                  onClick={() => startNewChat(activePersona)}
+                >
+                  + New Chat
+                </button>
+                <div style={{ display: 'flex', gap: 4, width: '100%' }}>
+                  {(['coder', 'researcher', 'creative'] as const).map((p) => (
                     <button
-                      onClick={(e) => handleDeleteSession(e, s.sessionId)}
+                      key={p}
+                      onClick={() => startNewChat(p)}
                       style={{
-                        background: 'none', border: 'none', color: 'var(--text-muted)',
-                        cursor: 'pointer', fontSize: 11, opacity: isActive ? 1 : 0,
+                        flex: 1,
+                        padding: '4px',
+                        fontSize: '10px',
+                        border: '1px solid var(--border)',
+                        borderRadius: 'var(--radius-sm)',
+                        background: 'var(--bg-card)',
+                        color: 'var(--text-secondary)',
+                        cursor: 'pointer',
                       }}
-                      className="delete-chat-btn"
-                      title="Delete chat"
+                      title={`Create new ${p} chat`}
                     >
-                      ✕
+                      {p === 'coder' && '💻'}
+                      {p === 'researcher' && '🔍'}
+                      {p === 'creative' && '✍'}
                     </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* List of chat sessions */}
+              <div className="flex-1 overflow-auto" style={{ padding: '8px 6px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', paddingLeft: 8, paddingBottom: 6, letterSpacing: '0.08em' }}>
+                  Recent Chats
+                </div>
+                {sessionsList.length === 0 && (
+                  <div style={{ padding: 12, color: 'var(--text-muted)', fontSize: 11, textAlign: 'center' }}>
+                    No past chats
                   </div>
-                );
-              })}
-            </div>
-          </aside>
-        )}
+                )}
+                {sessionsList.map((s) => {
+                  const isActive = s.sessionId === activeSessionId;
+                  const badge = personaBadges[s.persona as PersonaType] || { label: 'Agent', color: 'var(--text-muted)' };
+                  return (
+                    <div
+                      key={s.sessionId}
+                      onClick={() => setActiveSessionId(s.sessionId)}
+                      className="flex items-center justify-between"
+                      style={{
+                        padding: '8px 10px',
+                        borderRadius: 'var(--radius-md)',
+                        background: isActive ? 'var(--accent-glow)' : 'transparent',
+                        color: isActive ? 'var(--accent-light)' : 'var(--text-primary)',
+                        cursor: 'pointer',
+                        fontSize: 12.5,
+                        transition: 'background 0.15s',
+                      }}
+                      onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = 'var(--bg-hover)'; }}
+                      onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
+                    >
+                      <div className="flex flex-col flex-1 truncate" style={{ marginRight: 6 }}>
+                        <span className="truncate" style={{ fontWeight: 500 }}>
+                          {s.title}
+                        </span>
+                        <span style={{ fontSize: 9, color: badge.color, marginTop: 2, display: 'inline-block' }}>
+                          {badge.label}
+                        </span>
+                      </div>
+                      <button
+                        onClick={(e) => handleDeleteSession(e, s.sessionId)}
+                        style={{
+                          background: 'none', border: 'none', color: 'var(--text-muted)',
+                          cursor: 'pointer', fontSize: 11, opacity: isActive ? 1 : 0,
+                        }}
+                        className="delete-chat-btn"
+                        title="Delete chat"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </aside>
+          )}
+
+          {/* Collapse tab — right edge of sidebar */}
+          <button
+            onClick={() => setSidebarOpen((o) => !o)}
+            title={sidebarOpen ? 'Collapse chats (Alt+C)' : 'Open chats (Alt+C)'}
+            style={{
+              width: 18,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 6,
+              background: 'var(--bg-surface)',
+              borderRight: '1px solid var(--border)',
+              borderLeft: 'none',
+              borderTop: 'none',
+              borderBottom: 'none',
+              cursor: 'pointer',
+              color: 'var(--text-muted)',
+              fontSize: 9,
+              padding: '0 2px',
+              transition: 'color 0.15s, background 0.15s',
+              flexShrink: 0,
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; e.currentTarget.style.background = 'var(--bg-hover)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--bg-surface)'; }}
+          >
+            <span style={{ fontSize: 11 }}>💬</span>
+            <span style={{ fontSize: 10 }}>{sidebarOpen ? '◀' : '▶'}</span>
+          </button>
+        </div>
 
         {/* Workspace Layout */}
         <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minWidth: 0 }}>
@@ -408,6 +493,7 @@ export default function App() {
               persona={activePersona}
               contextSize={contextSize}
               thinkingMode={thinkingMode}
+              cavemanMode={cavemanMode}
               sidebarOpen={sidebarOpen}
               rightPanelOpen={rightPanelOpen}
               onToggleSidebar={() => setSidebarOpen((o) => !o)}
@@ -415,74 +501,104 @@ export default function App() {
             />
           </div>
 
-          {/* Right Panel: Collapsible Editor, Terminal & Files */}
-          {rightPanelOpen && (
-            <div style={{
-              width: '50%',
-              minWidth: 400,
-              display: 'flex',
-              flexDirection: 'column',
-              borderLeft: '1px solid var(--border)',
-              overflow: 'hidden',
-              background: 'var(--bg-surface)',
-            }}>
-              {/* Tab headers */}
-              <div style={{
+          {/* Right Panel: always-present; collapse tab on its left edge */}
+          <div style={{ display: 'flex', flexShrink: 0, borderLeft: '1px solid var(--border)' }}>
+            {/* Collapse tab — left edge of right panel */}
+            <button
+              onClick={() => setRightPanelOpen((o) => !o)}
+              title={rightPanelOpen ? 'Collapse workspace tools (Alt+T)' : 'Open workspace tools (Alt+T)'}
+              style={{
+                width: 18,
                 display: 'flex',
-                borderBottom: '1px solid var(--border)',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 6,
                 background: 'var(--bg-surface)',
+                border: 'none',
+                borderRight: '1px solid var(--border)',
+                cursor: 'pointer',
+                color: 'var(--text-muted)',
+                fontSize: 9,
+                padding: '0 2px',
+                transition: 'color 0.15s, background 0.15s',
                 flexShrink: 0,
-              }}>
-                {([
-                  { id: 'editor', label: '📝 Editor' },
-                  { id: 'terminal', label: '⌨ Terminal' },
-                  { id: 'files', label: '📁 Files' },
-                ] as const).map((tab) => (
-                  <button
-                    key={tab.id}
-                    onClick={() => setRightPanelTab(tab.id)}
-                    style={{
-                      padding: '9px 18px',
-                      fontSize: 12,
-                      fontWeight: 500,
-                      background: 'none',
-                      border: 'none',
-                      borderBottom: `2px solid ${rightPanelTab === tab.id ? 'var(--accent)' : 'transparent'}`,
-                      color: rightPanelTab === tab.id ? 'var(--accent-light)' : 'var(--text-muted)',
-                      cursor: 'pointer',
-                      transition: 'all 0.15s',
-                    }}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-                {selectedFile && rightPanelTab === 'editor' && (
-                  <span style={{
-                    alignSelf: 'center', marginLeft: 'auto', marginRight: 12,
-                    fontSize: 11, fontFamily: 'var(--font-mono)',
-                    color: 'var(--text-muted)', maxWidth: 200,
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  }}>
-                    {selectedFile}
-                  </span>
-                )}
-              </div>
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; e.currentTarget.style.background = 'var(--bg-hover)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--bg-surface)'; }}
+            >
+              <span style={{ fontSize: 10 }}>{rightPanelOpen ? '▶' : '◀'}</span>
+              <span style={{ fontSize: 11 }}>⊞</span>
+            </button>
 
-              {/* Panel content */}
-              <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-                {rightPanelTab === 'editor' && <FileEditor filePath={selectedFile} />}
-                {rightPanelTab === 'terminal' && <TerminalPane label="User Terminal" />}
-                {rightPanelTab === 'files' && (
-                  <FileExplorer
-                    onSelectFile={handleFileSelect}
-                    selectedPath={selectedFile ?? undefined}
-                    folderOpenState={folderOpenState}
-                    onFolderOpenChange={handleFolderOpenChange}
-                  />
-                )}
+            {/* Panel content */}
+            {rightPanelOpen && (
+              <div style={{
+                width: '50vw',
+                minWidth: 400,
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden',
+                background: 'var(--bg-surface)',
+              }}>
+                {/* Tab headers */}
+                <div style={{
+                  display: 'flex',
+                  borderBottom: '1px solid var(--border)',
+                  background: 'var(--bg-surface)',
+                  flexShrink: 0,
+                }}>
+                  {([
+                    { id: 'editor', label: '📝 Editor' },
+                    { id: 'terminal', label: '⌨ Terminal' },
+                    { id: 'files', label: '📁 Files' },
+                  ] as const).map((tab) => (
+                    <button
+                      key={tab.id}
+                      onClick={() => setRightPanelTab(tab.id)}
+                      style={{
+                        padding: '9px 18px',
+                        fontSize: 12,
+                        fontWeight: 500,
+                        background: 'none',
+                        border: 'none',
+                        borderBottom: `2px solid ${rightPanelTab === tab.id ? 'var(--accent)' : 'transparent'}`,
+                        color: rightPanelTab === tab.id ? 'var(--accent-light)' : 'var(--text-muted)',
+                        cursor: 'pointer',
+                        transition: 'all 0.15s',
+                      }}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                  {selectedFile && rightPanelTab === 'editor' && (
+                    <span style={{
+                      alignSelf: 'center', marginLeft: 'auto', marginRight: 12,
+                      fontSize: 11, fontFamily: 'var(--font-mono)',
+                      color: 'var(--text-muted)', maxWidth: 200,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>
+                      {selectedFile}
+                    </span>
+                  )}
+                </div>
+
+                {/* Panel content */}
+                <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                  {rightPanelTab === 'editor' && <FileEditor filePath={selectedFile} />}
+                  {rightPanelTab === 'terminal' && <TerminalPane label="User Terminal" />}
+                  {rightPanelTab === 'files' && (
+                    <FileExplorer
+                      onSelectFile={handleFileSelect}
+                      selectedPath={selectedFile ?? undefined}
+                      folderOpenState={folderOpenState}
+                      onFolderOpenChange={handleFolderOpenChange}
+                    />
+                  )}
+                </div>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
 

@@ -168,10 +168,48 @@ export async function runTool(name: ToolName, args: Record<string, string>): Pro
       }
 
       case 'run_terminal': {
-        const { stdout, stderr } = await execAsync(args.command, { cwd: WORKSPACE_DIR, timeout: TERMINAL_TIMEOUT_MS, shell: 'cmd.exe' });
-        const output = [stdout, stderr].filter(Boolean).join('\n').trim();
-        return { success: true, output: output || '(no output)' };
+        // ── Windows command normalisation ────────────────────────────────────
+        // Models trained on Linux/macOS often emit bash syntax that cmd.exe
+        // rejects. Translate the most common patterns before execution so that
+        // even weaker models can create files and directories reliably.
+        let command: string = args.command.trim();
+
+        // 1. `mkdir -p <path>` → PowerShell New-Item which is idempotent
+        command = command.replace(
+          /^mkdir\s+-p\s+(.+)$/i,
+          (_, p) => `powershell -Command "New-Item -ItemType Directory -Force -Path '${p.trim()}' | Out-Null"`,
+        );
+
+        // 2. `mkdir a && mkdir a/b` (or `mkdir a\b`) — convert each mkdir
+        //    segment into an idempotent PowerShell call, then chain with `;`
+        if (/^\s*mkdir\b/.test(command) && !/powershell/i.test(command)) {
+          // Split on && or ; and translate every `mkdir foo` fragment
+          const parts = command.split(/\s*(?:&&|;)\s*/);
+          const translated = parts.map((part) => {
+            const m = part.trim().match(/^mkdir\s+(.+)$/i);
+            if (!m) return part;
+            return `powershell -Command "New-Item -ItemType Directory -Force -Path '${m[1].trim()}' | Out-Null"`;
+          });
+          command = translated.join(' && ');
+        }
+
+        // ── Execute ─────────────────────────────────────────────────────────
+        try {
+          const { stdout, stderr } = await execAsync(command, { cwd: WORKSPACE_DIR, timeout: TERMINAL_TIMEOUT_MS, shell: 'cmd.exe' });
+          const output = [stdout, stderr].filter(Boolean).join('\n').trim();
+          return { success: true, output: output || '(no output)' };
+        } catch (execErr: any) {
+          const msg: string = execErr?.message ?? String(execErr);
+          // "already exists" / EEXIST — directory is present, treat as success
+          // so the model doesn't spiral into a retry loop.
+          const alreadyExists = /already exists|subdirectory or file|eexist/i.test(msg);
+          if (alreadyExists) {
+            return { success: true, output: '(already existed — no action needed, continue with next step)' };
+          }
+          throw execErr; // re-throw; outer catch will return success:false
+        }
       }
+
 
       default:
         return { success: false, output: `Unknown tool: ${name}` };

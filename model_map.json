@@ -7,7 +7,7 @@
             "name": "Llama 3.1 8B Virtuoso (Abliterated)",
             "size_gb": 8.5,
             "max_context": 131072,
-            "quantization": "FP16/GGUF",
+            "quantization": "Q8_0",
             "capabilities": {
                 "vision": false,
                 "function_calling": true,
@@ -55,7 +55,7 @@
             "id": "qwen3-coder:30b",
             "name": "Qwen3 Coder 30B (MoE)",
             "size_gb": 18.0,
-            "max_context": 131072,
+            "max_context": 262144,
             "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": false,
@@ -69,14 +69,18 @@
         {
             "id": "North-Mini-Code-1-0-GGUF:latest",
             "name": "North Mini Code 1.0",
-            "size_gb": 14.0,
-            "max_context": 32768,
+            "size_gb": 18.7,
+            "max_context": 262144,
             "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": false,
                 "function_calling": true,
-                "thinking_mode": false,
+                "thinking_mode": true,
                 "uncensored": false
+            },
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
             },
             "system_prompt_type": "chatml",
             "recommended_use": "Local coding assistance and fast script drafting"
@@ -85,46 +89,16 @@
             "id": "Devstral-Small-2-24B-Q3_K_M:latest",
             "name": "Devstral Small 2 24B",
             "size_gb": 11.0,
-            "max_context": 32768,
+            "max_context": 262144,
             "quantization": "Q3_K_M",
             "capabilities": {
-                "vision": false,
+                "vision": true,
                 "function_calling": true,
                 "thinking_mode": false,
                 "uncensored": false
             },
             "system_prompt_type": "mistral",
             "recommended_use": "Software architecture, refactoring, and code analysis"
-        },
-        {
-            "id": "huihui-gemma-131k:latest",
-            "name": "Huihui Gemma (131K Context)",
-            "size_gb": 16.0,
-            "max_context": 131072,
-            "quantization": "Q4_K_M",
-            "capabilities": {
-                "vision": false,
-                "function_calling": true,
-                "thinking_mode": false,
-                "uncensored": true
-            },
-            "system_prompt_type": "gemma",
-            "recommended_use": "Large document extraction, long text processing without refusal filters"
-        },
-        {
-            "id": "qwen3-6-27b-131k:latest",
-            "name": "Qwen 3.6 27B (131K)",
-            "size_gb": 13.0,
-            "max_context": 131072,
-            "quantization": "Q4_K_M",
-            "capabilities": {
-                "vision": false,
-                "function_calling": true,
-                "thinking_mode": false,
-                "uncensored": false
-            },
-            "system_prompt_type": "qwen",
-            "recommended_use": "High-accuracy long context chat, research, structured output"
         },
         {
             "id": "GPT_20B:latest",
@@ -154,13 +128,17 @@
             "id": "Qwen3-6-27B-Q3_K_M:latest",
             "name": "Qwen 3.6 27B (Q3 Quant)",
             "size_gb": 13.0,
-            "max_context": 131072,
+            "max_context": 262144,
             "quantization": "Q3_K_M",
             "capabilities": {
-                "vision": false,
+                "vision": true,
                 "function_calling": true,
-                "thinking_mode": false,
+                "thinking_mode": true,
                 "uncensored": false
+            },
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
             },
             "system_prompt_type": "qwen",
             "recommended_use": "VRAM-efficient long context reasoning"
@@ -169,7 +147,7 @@
             "id": "laguna-xs-2.1:q4_K_M",
             "name": "Laguna XS 2.1",
             "size_gb": 20.0,
-            "max_context": 32768,
+            "max_context": 262144,
             "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": false,
@@ -186,9 +164,9 @@
         },
         {
             "id": "phi3:latest",
-            "name": "Microsoft Phi-3 Mini (3.8B)",
+            "name": "Microsoft Phi-3 Mini (3.8B, 4K)",
             "size_gb": 2.2,
-            "max_context": 131072,
+            "max_context": 4096,
             "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": false,
@@ -201,9 +179,9 @@
         },
         {
             "id": "granite3-moe:latest",
-            "name": "IBM Granite 3 MoE",
+            "name": "IBM Granite 3.0 MoE",
             "size_gb": 0.82,
-            "max_context": 131072,
+            "max_context": 4096,
             "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": false,
@@ -215,8 +193,8 @@
             "recommended_use": "Ultra-lightweight background classification, intent detection, and quick tool calling"
         },
         {
-            "id": "nemotron-orchestrator-8b-claude-4_5-opus-distill_q4_k_m:latest",
-            "name": "Nemotron Orchestrator 8B (Claude 4.5 Distill)",
+            "id": "nemotron-orchestrator-8b-qwen3-distill_q4_k_m:latest",
+            "name": "Nemotron Orchestrator 8B (Qwen3-8B base)",
             "size_gb": 5.0,
             "max_context": 32768,
             "quantization": "Q4_K_M",
@@ -237,7 +215,7 @@
             "id": "gemma4:26b-uncensored",
             "name": "Huihui Gemma 4 26B Vision (Abliterated)",
             "size_gb": 16.0,
-            "max_context": 131072,
+            "max_context": 262144,
             "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": true,

@@ -15,6 +15,7 @@ interface Props {
   persona: string;
   contextSize: number;
   thinkingMode: boolean;
+  cavemanMode: boolean;
   sidebarOpen: boolean;
   rightPanelOpen: boolean;
   onToggleSidebar: () => void;
@@ -33,6 +34,7 @@ export function ChatPanel({
   persona,
   contextSize,
   thinkingMode,
+  cavemanMode,
   sidebarOpen,
   rightPanelOpen,
   onToggleSidebar,
@@ -65,8 +67,8 @@ export function ChatPanel({
     const text = input.trim();
     if (!text || !model || isRunning) return;
     setInput('');
-    sendMessage(text, model, sessionId, persona, { numCtx: contextSize, think: thinkingMode });
-  }, [input, isRunning, model, sessionId, sendMessage, persona, contextSize, thinkingMode]);
+    sendMessage(text, model, sessionId, persona, { numCtx: contextSize, think: thinkingMode, caveman: cavemanMode });
+  }, [input, isRunning, model, sessionId, sendMessage, persona, contextSize, thinkingMode, cavemanMode]);
 
   const handleKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -77,63 +79,6 @@ export function ChatPanel({
 
   return (
     <div className="flex-col" style={{ height: '100%', display: 'flex', position: 'relative' }}>
-      {/* Floating Left Sidebar Toggle (visible only when collapsed) */}
-      {!sidebarOpen && (
-        <button
-          onClick={onToggleSidebar}
-          style={{
-            position: 'absolute',
-            left: 12,
-            top: 12,
-            zIndex: 100,
-            background: 'var(--accent)',
-            border: 'none',
-            borderRadius: '50%',
-            width: 32,
-            height: 32,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: '#fff',
-            cursor: 'pointer',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
-            fontSize: 14,
-            transition: 'background 0.2s',
-          }}
-          title="Open Chats List (Alt+C)"
-        >
-          💬
-        </button>
-      )}
-
-      {/* Floating Right Panel Toggle (visible only when collapsed) */}
-      {!rightPanelOpen && (
-        <button
-          onClick={onToggleRightPanel}
-          style={{
-            position: 'absolute',
-            right: 12,
-            top: 12,
-            zIndex: 100,
-            background: 'var(--accent)',
-            border: 'none',
-            borderRadius: '50%',
-            width: 32,
-            height: 32,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: '#fff',
-            cursor: 'pointer',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
-            fontSize: 14,
-            transition: 'background 0.2s',
-          }}
-          title="Open Workspace Tools (Alt+T)"
-        >
-          ⊞
-        </button>
-      )}
 
       {persona === 'creative' && (
         <div className="flex items-center justify-between" style={{ padding: '7px 16px', borderBottom: '1px solid var(--border)', background: 'var(--bg-surface)' }}>
@@ -154,7 +99,7 @@ export function ChatPanel({
           messages={messages}
           status={status}
           modelAvailable={Boolean(model)}
-          onGenerate={(prompt) => sendMessage(prompt, model, sessionId, persona, { isolated: true, numCtx: contextSize, think: thinkingMode })}
+          onGenerate={(prompt) => sendMessage(prompt, model, sessionId, persona, { isolated: true, numCtx: contextSize, think: thinkingMode, caveman: cavemanMode })}
         />
       ) : <>
       {/* Messages */}
