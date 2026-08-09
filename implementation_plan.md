@@ -44,7 +44,7 @@ A standalone, full-featured local AI agent interface built with **React + TypeSc
 | **Prompt intake** | Multi-line textarea with keyboard shortcuts |
 | **Ollama streaming chat** | SSE/WebSocket stream from Ollama's `/api/chat` |
 | **Tool-use loop** | Agent calls tools: `web_search`, `browse_url`, `write_file`, `read_file`, `run_terminal` |
-| **DuckDuckGo search** | Free `ddg-search` API — no key needed |
+| **Web search** | Brave Search API by default, DuckDuckGo only after explicit credit exhaustion |
 | **Playwright browsing** | Headless Chromium scrapes pages the agent requests |
 | **File write to disk** | Agent writes files to `<project>/agent-workspace/` |
 | **File preview + edit** | Monaco-style editor pane with syntax highlighting (CodeMirror) |
@@ -111,8 +111,11 @@ ollama-agent-ui/
 ### Tool-Use Protocol
 The agent uses Ollama's native `tools` API (available in models like `qwen2.5`, `llama3.1`, `mistral-nemo`). The backend runs a **tool-call loop**: stream response → if tool call detected → execute tool → feed result back → continue streaming. A `stop` flag is checked between each loop iteration.
 
-### DuckDuckGo Search
-Uses the free `duck-duck-scrape` npm package (no API key). Returns organic results with titles, URLs, and snippets.
+### Web Search
+Uses Brave Search API by default. Set `BRAVE_SEARCH_API_KEY` in the server environment.
+Falls back to existing DuckDuckGo search only when Brave returns HTTP 402 with an explicit
+exhausted/depleted/insufficient credit or quota message. Other Brave failures, including
+invalid requests, rate limits, timeouts, and network failures, never trigger provider fallback.
 
 ### Playwright
 Runs as a Node subprocess using `@playwright/test` or `playwright-core` with Chromium. The backend launches a browser instance on server start and keeps it alive for reuse, closing pages after each tool call.

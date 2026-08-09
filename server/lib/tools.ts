@@ -10,7 +10,7 @@ export const TOOL_DEFINITIONS = [
     type: 'function',
     function: {
       name: 'web_search',
-      description: 'Search the web using DuckDuckGo and return a list of results with titles, URLs, and snippets.',
+      description: 'Search the web using Brave Search. If Brave explicitly reports exhausted credits, fall back to DuckDuckGo. Return titles, URLs, and snippets.',
       parameters: {
         type: 'object',
         properties: {

@@ -44,6 +44,12 @@ On a single-user 32GB RAM machine, we want to maximize the hardware resources de
 Headless browsers used for search retrieval normally download images, stylesheets, fonts, and heavy media assets, consuming massive CPU cycles and RAM.
 *   **Request Interception Optimization:** We have optimized `server/lib/playwright.ts` to block unnecessary network assets (`image`, `stylesheet`, `font`, and `media` files) during DuckDuckGo, Bing, Yahoo searches, and URL scraping.
 *   **Result:** Research cycles are **up to 10x faster**, page downloads are lightweight, and headless Chromium runs with minimal CPU/RAM footprint.
+### 6. Brave Search API with Strict Credit Fallback
+Set `BRAVE_SEARCH_API_KEY` in `.env` or the server environment. Web search uses Brave Search first.
+DuckDuckGo is used only when Brave returns HTTP 402 with an explicit exhausted, depleted,
+insufficient, exceeded, or reached credit/quota message. Authentication errors, invalid
+responses, bad requests, rate limits, timeouts, and network failures do not switch providers.
+
 
 ---
 
@@ -93,6 +99,15 @@ npm install
 
 # Run the client + server concurrently
 npm run dev
+```
+
+Before starting the server, configure Brave Search:
+
+```bash
+# PowerShell
+$env:BRAVE_SEARCH_API_KEY="your-brave-search-api-key"
+
+# Or place BRAVE_SEARCH_API_KEY=... in .env
 ```
 
 The application UI will be available at **`http://localhost:5174`** (Client) and proxy requests to the backend API.

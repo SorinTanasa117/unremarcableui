@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import fs from 'fs/promises';
 import path from 'path';
-import { ContextManager, Message } from '../lib/contextManager.js';
+import { ContextManager, Message, ToolCall } from '../lib/contextManager.js';
 import { runTool, ToolName } from '../lib/toolRunner.js';
 import { TOOL_DEFINITIONS, WORKSPACE_DIR } from '../lib/tools.js';
 
@@ -302,6 +302,76 @@ function createVisibleContentFilter() {
   return filter;
 }
 
+const FALLBACK_TOOL_NAMES = new Set<ToolName>([
+  'web_search',
+  'browse_url',
+  'write_file',
+  'read_file',
+  'run_terminal',
+]);
+
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCharCode(Number(code)));
+}
+
+// Parse tool-call XML emitted as visible model content.
+function parseFallbackToolCalls(content: string): ToolCall[] {
+  const calls: ToolCall[] = [];
+  let nextId = 0;
+  const addCall = (name: string, args: Record<string, unknown>) => {
+    if (!FALLBACK_TOOL_NAMES.has(name as ToolName)) return;
+    calls.push({
+      id: `fallback-${nextId++}`,
+      type: 'function',
+      function: { name, arguments: JSON.stringify(args) },
+    });
+  };
+
+  const blocks = [...content.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)];
+  for (const block of blocks) {
+    const body = block[1].trim();
+    if (body.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed?.name && parsed.arguments && typeof parsed.arguments === 'object') {
+          addCall(String(parsed.name), parsed.arguments);
+        }
+      } catch {}
+      continue;
+    }
+    for (const match of body.matchAll(/<function=([A-Za-z_][\w-]*)(?:\s*>)?([\s\S]*?)<\/function>/gi)) {
+      const args: Record<string, string> = {};
+      for (const parameter of match[2].matchAll(/<parameter=([^>\s]+)>([\s\S]*?)<\/parameter>/gi)) {
+        args[decodeXmlEntities(parameter[1])] = decodeXmlEntities(parameter[2]);
+      }
+      addCall(match[1], args);
+    }
+  }
+
+  const withoutBlocks = content.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '');
+  for (const match of withoutBlocks.matchAll(/<function=([A-Za-z_][\w-]*)(?:\s*>)?([\s\S]*?)<\/function>/gi)) {
+    const args: Record<string, string> = {};
+    for (const parameter of match[2].matchAll(/<parameter=([^>\s]+)>([\s\S]*?)<\/parameter>/gi)) {
+      args[decodeXmlEntities(parameter[1])] = decodeXmlEntities(parameter[2]);
+    }
+    addCall(match[1], args);
+  }
+  return calls;
+}
+
+function removeFallbackToolCallMarkup(content: string): string {
+  return content
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+    .replace(/<function=[A-Za-z_][\w-]*(?:\s*>)?[\s\S]*?<\/function>/gi, '')
+    .replace(/<\/tool_call>/gi, '');
+}
+
 async function fetchOllamaChat(body: unknown, signal: AbortSignal): Promise<Awaited<ReturnType<typeof fetch>>> {
   let lastError: unknown;
   const retryDelaysMs = [0, 2_000, 5_000];
@@ -390,15 +460,34 @@ async function getModelCapabilities(model: string, signal: AbortSignal): Promise
 }
 
 function normalizeOllamaMessages(messages: Message[], systemPromptType?: string): Message[] {
-  if (systemPromptType?.toLowerCase() !== 'mistral') return messages;
+  const outboundMessages = messages.map((message) => {
+    if (message.role !== 'assistant' || !message.tool_calls?.length) return message;
 
-  const systemContent = messages
+    const toolCalls = message.tool_calls.map((toolCall) => {
+      if (typeof toolCall.function.arguments !== 'string') return toolCall;
+      try {
+        const parsed: unknown = JSON.parse(toolCall.function.arguments);
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return {
+            ...toolCall,
+            function: { ...toolCall.function, arguments: parsed },
+          };
+        }
+      } catch {}
+      return toolCall;
+    });
+    return { ...message, tool_calls: toolCalls as unknown as Message['tool_calls'] };
+  });
+
+  if (systemPromptType?.toLowerCase() !== 'mistral') return outboundMessages;
+
+  const systemContent = outboundMessages
     .filter((message) => message.role === 'system')
     .map((message) => message.content)
     .join('\n\n');
-  if (!systemContent) return messages;
+  if (!systemContent) return outboundMessages;
 
-  const nonSystemMessages = messages.filter((message) => message.role !== 'system');
+  const nonSystemMessages = outboundMessages.filter((message) => message.role !== 'system');
   const firstUserIndex = nonSystemMessages.findIndex((message) => message.role === 'user');
   if (firstUserIndex < 0) {
     return [{ role: 'user', content: systemContent }, ...nonSystemMessages];
@@ -848,7 +937,7 @@ router.post('/chat', async (req: Request, res: Response) => {
       //     still allowing one-line status lines between tool calls so the UI
       //     user can see "ran weblink check on www.example.com — 4 hits." etc.
       const CAVEMAN_TOOL_DEFINITIONS = [
-        { type: 'function', function: { name: 'web_search',   description: 'DuckDuckGo search. Returns results.',        parameters: { type: 'object', properties: { query:    { type: 'string' } }, required: ['query'] } } },
+        { type: 'function', function: { name: 'web_search',   description: 'Brave Search; DuckDuckGo only if Brave reports exhausted credits. Returns results.', parameters: { type: 'object', properties: { query:    { type: 'string' } }, required: ['query'] } } },
         { type: 'function', function: { name: 'browse_url',   description: 'Fetch URL. Returns page text.',               parameters: { type: 'object', properties: { url:      { type: 'string' } }, required: ['url'] } } },
         { type: 'function', function: { name: 'write_file',   description: 'Write file to agent-workspace.',              parameters: { type: 'object', properties: { filepath: { type: 'string' }, content: { type: 'string' } }, required: ['filepath', 'content'] } } },
         { type: 'function', function: { name: 'read_file',    description: 'Read file from agent-workspace.',             parameters: { type: 'object', properties: { filepath: { type: 'string' } }, required: ['filepath'] } } },
@@ -963,6 +1052,14 @@ router.post('/chat', async (req: Request, res: Response) => {
       if (finalVisibleContent) {
         assistantContent += finalVisibleContent;
         send('token', { content: finalVisibleContent });
+      }
+
+      if (pendingToolCalls.length === 0) {
+        const fallbackToolCalls = parseFallbackToolCalls(assistantContent);
+        if (fallbackToolCalls.length > 0) {
+          pendingToolCalls.push(...fallbackToolCalls);
+          assistantContent = removeFallbackToolCallMarkup(assistantContent);
+        }
       }
 
       // Push assistant response

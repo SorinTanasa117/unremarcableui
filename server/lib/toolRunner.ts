@@ -14,6 +14,8 @@ const SEARCH_MIN_INTERVAL_MS = 8_000;
 const SEARCH_JITTER_MS = 2_000;
 const SEARCH_PROVIDER_TIMEOUT_MS = 12_000;
 const FALLBACK_SWITCH_DELAY_MS = 3_000;
+const BRAVE_SEARCH_API_URL = 'https://api.search.brave.com/res/v1/web/search';
+const BRAVE_SEARCH_API_KEY = process.env.BRAVE_SEARCH_API_KEY?.trim();
 let nextSearchAt = 0;
 
 export type ToolName = 'web_search' | 'browse_url' | 'write_file' | 'read_file' | 'run_terminal';
@@ -78,7 +80,51 @@ function formatSearchResults(results: SearchResult[]): string {
   ).join('\n\n');
 }
 
-async function runWebSearch(query: string): Promise<ToolResult> {
+function isBraveCreditExhaustion(body: string): boolean {
+  const message = body.toLowerCase();
+  const namesCreditProblem = /credit|quota/.test(message);
+  const saysUsedUp = /exhaust|deplet|insufficient|used\s*up|limit\s*(?:has\s*)?(?:been\s*)?(?:reached|exceeded)|exceed(?:ed)?|reach(?:ed)?/.test(message);
+  return namesCreditProblem && saysUsedUp;
+}
+
+async function searchBrave(query: string): Promise<SearchResult[]> {
+  if (!BRAVE_SEARCH_API_KEY) {
+    throw new Error('Brave Search is not configured. Set BRAVE_SEARCH_API_KEY.');
+  }
+
+  const url = `${BRAVE_SEARCH_API_URL}?q=${encodeURIComponent(query)}&count=8`;
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/json',
+      'X-Subscription-Token': BRAVE_SEARCH_API_KEY,
+    },
+    signal: AbortSignal.timeout(SEARCH_PROVIDER_TIMEOUT_MS),
+  });
+  const body = await response.text();
+
+  if (!response.ok) {
+    const creditExhausted = isBraveCreditExhaustion(body);
+    const detail = body.slice(0, 500);
+    const error = new Error(`Brave Search returned HTTP ${response.status}: ${detail || response.statusText}`);
+    (error as Error & { creditExhausted?: boolean }).creditExhausted = creditExhausted;
+    throw error;
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    throw new Error('Brave Search returned invalid JSON.');
+  }
+
+  return (payload.web?.results ?? []).map((result: any) => ({
+    title: result.title ?? '',
+    url: result.url ?? '',
+    description: result.description ?? '',
+  })).filter((result: SearchResult) => result.title && result.url);
+}
+
+async function runDuckDuckGoSearch(query: string): Promise<ToolResult> {
   await waitForSearchSlot();
   let libraryError = '';
   try {
@@ -132,6 +178,32 @@ async function runWebSearch(query: string): Promise<ToolResult> {
       output: `Search unavailable. DuckDuckGo API: ${libraryError}. DuckDuckGo browser fallback: ${duckDuckGoBrowserError}. Bing browser fallback: ${bingErrorDetail}. Yahoo browser fallback: ${detail}. Do not guess URLs or repeat this search; explain the limitation and provide only verifiable partial findings.`,
     };
   }
+}
+
+async function runWebSearch(query: string): Promise<ToolResult> {
+  await waitForSearchSlot();
+
+  try {
+    const results = keepRelevantResults(
+      await searchBrave(query),
+      query,
+    );
+    if (results.length) return { success: true, output: formatSearchResults(results) };
+    return {
+      success: false,
+      output: 'Brave Search returned no usable results. Do not guess URLs or switch search providers.',
+    };
+  } catch (error: any) {
+    if (!(error?.creditExhausted === true)) {
+      return {
+        success: false,
+        output: `Brave Search failed: ${error?.message ?? String(error)} Do not switch search providers unless Brave explicitly reports exhausted credits.`,
+      };
+    }
+  }
+
+  await sleep(FALLBACK_SWITCH_DELAY_MS);
+  return runDuckDuckGoSearch(query);
 }
 
 export async function runTool(name: ToolName, args: Record<string, string>): Promise<ToolResult> {
