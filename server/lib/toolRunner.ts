@@ -141,11 +141,16 @@ export async function runTool(name: ToolName, args: Record<string, string>): Pro
         return runWebSearch(args.query);
 
       case 'browse_url': {
-        const result = await browseUrl(args.url);
-        if (result.status >= 400 || result.status === 0) {
-          return { success: false, output: `Page request failed (HTTP ${result.status || 'unknown'}) for ${result.url}. Do not treat this page as a source or guess a replacement URL.` };
+        try {
+          // browseUrl already internally handles safe timeout in 22s and ensures page closure
+          const result = await browseUrl(args.url);
+          if (result.status >= 400 || result.status === 0) {
+            return { success: false, output: `Page request failed (HTTP ${result.status || 'unknown'}) for ${result.url}. Do not treat this page as a source or guess a replacement URL.` };
+          }
+          return { success: true, output: result.text || '(empty page)' };
+        } catch (err: any) {
+          return { success: false, output: `Page request timed out or failed: ${err.message || String(err)}. Do not treat this page as a source or guess a replacement URL.` };
         }
-        return { success: true, output: result.text || '(empty page)' };
       }
 
       case 'write_file': {
