@@ -1,0 +1,252 @@
+{
+    "version": "1.0",
+    "default_model": "qwen3-coder:30b",
+    "models": [
+        {
+            "id": "mirage335/Llama-3_1-8B-Instruct-abliterated-virtuoso:latest",
+            "name": "Llama 3.1 8B Virtuoso (Abliterated)",
+            "size_gb": 8.5,
+            "max_context": 131072,
+            "quantization": "FP16/GGUF",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": true
+            },
+            "system_prompt_type": "llama3",
+            "recommended_use": "Fast general instruction, creative writing, uncensored chat"
+        },
+        {
+            "id": "Dolphin3-0-R1-Mistral-24B-abliterated-Q4_K_M:latest",
+            "name": "Dolphin 3.0 R1 Mistral 24B",
+            "size_gb": 14.0,
+            "max_context": 32768,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": true,
+                "uncensored": true
+            },
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
+            },
+            "system_prompt_type": "chatml",
+            "recommended_use": "Uncensored complex math, step-by-step logic, and agentic tasks"
+        },
+        {
+            "id": "phi4:latest",
+            "name": "Microsoft Phi-4 (14B)",
+            "size_gb": 9.1,
+            "max_context": 16384,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": false,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "phi4",
+            "recommended_use": "STEM, mathematical reasoning, and logical problem solving"
+        },
+        {
+            "id": "qwen3-coder:30b",
+            "name": "Qwen3 Coder 30B (MoE)",
+            "size_gb": 18.0,
+            "max_context": 131072,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "qwen",
+            "recommended_use": "Full codebase engineering, complex script generation, repository editing"
+        },
+        {
+            "id": "North-Mini-Code-1-0-GGUF:latest",
+            "name": "North Mini Code 1.0",
+            "size_gb": 14.0,
+            "max_context": 32768,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "chatml",
+            "recommended_use": "Local coding assistance and fast script drafting"
+        },
+        {
+            "id": "Devstral-Small-2-24B-Q3_K_M:latest",
+            "name": "Devstral Small 2 24B",
+            "size_gb": 11.0,
+            "max_context": 32768,
+            "quantization": "Q3_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "mistral",
+            "recommended_use": "Software architecture, refactoring, and code analysis"
+        },
+        {
+            "id": "huihui-gemma-131k:latest",
+            "name": "Huihui Gemma (131K Context)",
+            "size_gb": 16.0,
+            "max_context": 131072,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": true
+            },
+            "system_prompt_type": "gemma",
+            "recommended_use": "Large document extraction, long text processing without refusal filters"
+        },
+        {
+            "id": "qwen3-6-27b-131k:latest",
+            "name": "Qwen 3.6 27B (131K)",
+            "size_gb": 13.0,
+            "max_context": 131072,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "qwen",
+            "recommended_use": "High-accuracy long context chat, research, structured output"
+        },
+        {
+            "id": "GPT_20B:latest",
+            "name": "OpenAI GPT-OSS 20B (MoE)",
+            "size_gb": 13.0,
+            "max_context": 131072,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": true,
+                "uncensored": false
+            },
+            "thinking_config": {
+                "tag": "thought",
+                "default_enabled": true,
+                "effort_levels": [
+                    "low",
+                    "medium",
+                    "high"
+                ]
+            },
+            "system_prompt_type": "harmony",
+            "recommended_use": "Edge/Local reasoning, agentic tool execution, step-by-step problem solving"
+        },
+        {
+            "id": "Qwen3-6-27B-Q3_K_M:latest",
+            "name": "Qwen 3.6 27B (Q3 Quant)",
+            "size_gb": 13.0,
+            "max_context": 131072,
+            "quantization": "Q3_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "qwen",
+            "recommended_use": "VRAM-efficient long context reasoning"
+        },
+        {
+            "id": "laguna-xs-2.1:q4_K_M",
+            "name": "Laguna XS 2.1",
+            "size_gb": 20.0,
+            "max_context": 32768,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": true
+            },
+            "system_prompt_type": "chatml",
+            "recommended_use": "Uncensored story generation and creative roleplay"
+        },
+        {
+            "id": "phi3:latest",
+            "name": "Microsoft Phi-3 Mini (3.8B)",
+            "size_gb": 2.2,
+            "max_context": 131072,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": false,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "phi3",
+            "recommended_use": "Ultra-fast low-resource text processing"
+        },
+        {
+            "id": "granite3-moe:latest",
+            "name": "IBM Granite 3 MoE",
+            "size_gb": 0.82,
+            "max_context": 131072,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "granite",
+            "recommended_use": "Ultra-lightweight background classification, intent detection, and quick tool calling"
+        },
+        {
+            "id": "nemotron-orchestrator-8b-claude-4_5-opus-distill_q4_k_m:latest",
+            "name": "Nemotron Orchestrator 8B (Claude 4.5 Distill)",
+            "size_gb": 5.0,
+            "max_context": 32768,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": true,
+                "uncensored": false
+            },
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
+            },
+            "system_prompt_type": "chatml",
+            "recommended_use": "Agent orchestration, structured workflow execution, multi-tool planning"
+        },
+        {
+            "id": "gemma4:26b-uncensored",
+            "name": "Huihui Gemma 4 26B Vision (Abliterated)",
+            "size_gb": 16.0,
+            "max_context": 131072,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": true,
+                "function_calling": true,
+                "thinking_mode": true,
+                "uncensored": true
+            },
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
+            },
+            "system_prompt_type": "gemma",
+            "recommended_use": "Multimodal image understanding, visual coding, uncensored complex tasks"
+        }
+    ]
+}

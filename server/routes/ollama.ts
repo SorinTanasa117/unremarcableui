@@ -494,6 +494,17 @@ router.get('/models', async (_req: Request, res: Response) => {
   }
 });
 
+// GET /api/ollama/model-map
+router.get('/model-map', async (_req: Request, res: Response) => {
+  try {
+    const filePath = path.resolve(WORKSPACE_DIR, '../model_map.json');
+    const content = await fs.readFile(filePath, 'utf-8');
+    res.json(JSON.parse(content));
+  } catch (err: any) {
+    res.status(500).json({ error: `Failed to load model map: ${err.message}` });
+  }
+});
+
 // GET /api/ollama/sessions — list persistent sessions
 router.get('/sessions', async (_req: Request, res: Response) => {
   try {
@@ -733,6 +744,7 @@ router.post('/chat', async (req: Request, res: Response) => {
     // tools disabled so it can write a candid partial report from successful
     // results already in the conversation.
     let forceFinalResponse = false;
+    let finalResponseRetryCount = 0;
     while (iterating && !ac.signal.aborted) {
       const capabilities = await getModelCapabilities(model, ac.signal);
       const activeContext = activeContextSize;
@@ -857,13 +869,72 @@ router.post('/chat', async (req: Request, res: Response) => {
       // Save state after assistant response
       await saveSessionToFile(sessionId, ctx, selectedPersona, model);
 
-      if (pendingToolCalls.length > 0 && !ac.signal.aborted && !forceFinalResponse) {
+      if (pendingToolCalls.length > 0 && !ac.signal.aborted) {
+        if (forceFinalResponse) {
+          // Reject any tool calls generated when tools are no longer available,
+          // and ask the model to produce the final report.
+          for (const tc of pendingToolCalls) {
+            const toolName: ToolName = tc.function?.name;
+            send('tool_start', { name: toolName, args: {} });
+            send('tool_result', {
+              name: toolName,
+              success: false,
+              output: 'Research tools are no longer available. Write the final report now using only successful tool results already provided.',
+              durationMs: 0,
+            });
+            requestCtx.push({
+              role: 'tool',
+              content: 'Research tools are no longer available. Write the final report now using only successful tool results already provided. Do not call tools or invent sources.',
+              tool_call_id: tc.id ?? toolName,
+              tool_name: toolName,
+              duration_ms: 0,
+              created_at: Date.now(),
+            });
+          }
+          await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+          finalResponseRetryCount += 1;
+          if (finalResponseRetryCount >= 2) {
+            iterating = false;
+          }
+          continue;
+        }
+
         let toolBudgetExceeded = false;
-        for (const tc of pendingToolCalls) {
-          if (toolCallCount >= MAX_TOOL_CALLS_PER_RUN) {
+        let limitReason = '';
+        for (let i = 0; i < pendingToolCalls.length; i++) {
+          const tc = pendingToolCalls[i];
+
+          if (toolCallCount >= MAX_TOOL_CALLS_PER_RUN || toolFailureCount >= MAX_TOOL_FAILURES_PER_RUN || searchFailureCount >= MAX_SEARCH_FAILURES_PER_RUN) {
             toolBudgetExceeded = true;
+            limitReason = toolCallCount >= MAX_TOOL_CALLS_PER_RUN
+              ? `The research tool budget of ${MAX_TOOL_CALLS_PER_RUN} calls was reached.`
+              : searchFailureCount >= MAX_SEARCH_FAILURES_PER_RUN
+                ? 'Search providers repeatedly failed.'
+                : 'Research tools repeatedly failed.';
+
+            // Reject this and all subsequent tool calls in this turn to keep history valid
+            for (let j = i; j < pendingToolCalls.length; j++) {
+              const rejectTc = pendingToolCalls[j];
+              const toolName = rejectTc.function?.name ?? 'unknown_tool';
+              send('tool_start', { name: toolName, args: {} });
+              send('tool_result', {
+                name: toolName,
+                success: false,
+                output: `${limitReason} Tools are no longer available. Write the final report now.`,
+                durationMs: 0,
+              });
+              requestCtx.push({
+                role: 'tool',
+                content: `${limitReason} Tools are no longer available. Write the final report now using only successful tool results already provided. Do not call tools or invent sources.`,
+                tool_call_id: rejectTc.id ?? toolName,
+                tool_name: toolName,
+                duration_ms: 0,
+                created_at: Date.now(),
+              });
+            }
             break;
           }
+
           const toolName: ToolName = tc.function?.name;
           let args: Record<string, string> = {};
           try {
@@ -926,28 +997,11 @@ router.post('/chat', async (req: Request, res: Response) => {
             resumedRun.statusText = 'Processing results…';
             resumedRun.partialContent = '';
           }
-
-          if (toolFailureCount >= MAX_TOOL_FAILURES_PER_RUN || searchFailureCount >= MAX_SEARCH_FAILURES_PER_RUN) {
-            toolBudgetExceeded = true;
-            break;
-          }
         }
 
         send('tokens', requestCtx.getTokenUsage());
         await saveSessionToFile(sessionId, ctx, selectedPersona, model);
         if (toolBudgetExceeded) {
-          const reason = toolCallCount >= MAX_TOOL_CALLS_PER_RUN
-            ? `The research tool budget of ${MAX_TOOL_CALLS_PER_RUN} calls was reached.`
-            : searchFailureCount >= MAX_SEARCH_FAILURES_PER_RUN
-              ? 'Search providers repeatedly failed.'
-              : 'Research tools repeatedly failed.';
-          requestCtx.push({
-            role: 'tool',
-            content: `${reason} Stop using tools and produce the final partial report from successful results already retrieved. Explicitly disclose this limitation and do not invent sources.`,
-            tool_call_id: 'research-limit',
-            tool_name: 'research_limit',
-            created_at: Date.now(),
-          });
           forceFinalResponse = true;
         }
         continue;

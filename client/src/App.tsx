@@ -41,8 +41,26 @@ export default function App() {
   const [model, setModel] = useState('');
   const [contextSize, setContextSize] = useState(() => Number(localStorage.getItem('ollama_context_size')) || 32_768);
   const [thinkingMode, setThinkingMode] = useState(false);
+  const [modelMap, setModelMap] = useState<any>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [folderOpenState, setFolderOpenState] = useState<Record<string, boolean>>({});
+
+  // Fetch model map on startup
+  useEffect(() => {
+    fetch('/api/ollama/model-map')
+      .then((res) => res.json())
+      .then((data) => setModelMap(data))
+      .catch((err) => console.error('Failed to load model map:', err));
+  }, []);
+
+  // Automatically turn off thinking mode if the selected model does not support it
+  useEffect(() => {
+    if (!modelMap || !model) return;
+    const currentModelDef = modelMap.models?.find((m: any) => m.id === model);
+    if (currentModelDef && !currentModelDef.capabilities?.thinking_mode) {
+      setThinkingMode(false);
+    }
+  }, [model, modelMap]);
 
   // Active Session Persistence
   const [activeSessionId, setActiveSessionId] = useState<string>(() => {
@@ -161,7 +179,7 @@ export default function App() {
         </div>
 
         {/* Model selector */}
-        <ModelSelector value={model} onChange={setModel} disabled={isRunning} />
+        <ModelSelector value={model} onChange={setModel} disabled={isRunning} persona={activePersona} />
 
         <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
           <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Context</span>
@@ -176,10 +194,30 @@ export default function App() {
           </select>
         </div>
 
-        <label className="flex items-center gap-2" style={{ fontSize: 12, color: 'var(--text-secondary)', cursor: isRunning ? 'not-allowed' : 'pointer' }} title="Use model reasoning when supported">
-          <input type="checkbox" checked={thinkingMode} onChange={(event) => setThinkingMode(event.target.checked)} disabled={isRunning} />
-          Thinking mode
-        </label>
+        {(() => {
+          const selectedModelDef = modelMap?.models?.find((m: any) => m.id === model);
+          const supportsThinking = selectedModelDef ? (selectedModelDef.capabilities?.thinking_mode ?? false) : true;
+          return (
+            <label
+              className="flex items-center gap-2"
+              style={{
+                fontSize: 12,
+                color: supportsThinking ? 'var(--text-secondary)' : 'var(--text-muted)',
+                cursor: (isRunning || !supportsThinking) ? 'not-allowed' : 'pointer',
+                opacity: supportsThinking ? 1 : 0.5,
+              }}
+              title={supportsThinking ? 'Use model reasoning when supported' : 'Thinking mode not supported by this model'}
+            >
+              <input
+                type="checkbox"
+                checked={thinkingMode}
+                onChange={(event) => setThinkingMode(event.target.checked)}
+                disabled={isRunning || !supportsThinking}
+              />
+              Thinking mode
+            </label>
+          );
+        })()}
 
         {/* Persona selector */}
         <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
