@@ -374,10 +374,22 @@ async function getPersonaPrompt(personaKey: string): Promise<string> {
     }
 
     const persona = parsed[personaKey] || FALLBACK_PERSONAS[personaKey] || FALLBACK_PERSONAS.coder;
-    return `${persona}\n\nResponse rule: Begin directly with the requested final answer. Do not expose analysis, planning, chain-of-thought, or <think> tags.${personaKey === 'creative' ? ' Creative Mode is prose-only: write the requested text in the chat response. Never call tools, write files, read files, or describe file operations.' : ''}`;
+    let rule = '';
+    if (personaKey === 'creative') {
+      rule = '\n\nResponse rule: Begin directly with the requested final answer. Creative Mode is prose-only: write the requested text in the chat response. Never call tools, write files, read files, or describe file operations.';
+    } else {
+      rule = '\n\nResponse rule: Think step-by-step before executing tools or providing the final answer. If you support reasoning/thinking, format your internal thoughts inside <think>...</think> tags.';
+    }
+    return `${persona}${rule}`;
   } catch (err) {
     const persona = FALLBACK_PERSONAS[personaKey] || FALLBACK_PERSONAS.coder;
-    return `${persona}\n\nResponse rule: Begin directly with the requested final answer. Do not expose analysis, planning, chain-of-thought, or <think> tags.${personaKey === 'creative' ? ' Creative Mode is prose-only: write the requested text in the chat response. Never call tools, write files, read files, or describe file operations.' : ''}`;
+    let rule = '';
+    if (personaKey === 'creative') {
+      rule = '\n\nResponse rule: Begin directly with the requested final answer. Creative Mode is prose-only: write the requested text in the chat response. Never call tools, write files, read files, or describe file operations.';
+    } else {
+      rule = '\n\nResponse rule: Think step-by-step before executing tools or providing the final answer. If you support reasoning/thinking, format your internal thoughts inside <think>...</think> tags.';
+    }
+    return `${persona}${rule}`;
   }
 }
 

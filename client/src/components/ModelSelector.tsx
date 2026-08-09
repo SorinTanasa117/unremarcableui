@@ -64,9 +64,7 @@ function getModelCategories(model: any): string[] {
 
   // Writing / Creative Category
   if (
-    id.includes('laguna') || 
     id.includes('virtuoso') || 
-    name.includes('laguna') || 
     name.includes('virtuoso') || 
     recUse.includes('writing') || 
     recUse.includes('story') || 

@@ -174,11 +174,15 @@
             "capabilities": {
                 "vision": false,
                 "function_calling": true,
-                "thinking_mode": false,
-                "uncensored": true
+                "thinking_mode": true,
+                "uncensored": false
+            },
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
             },
             "system_prompt_type": "chatml",
-            "recommended_use": "Uncensored story generation and creative roleplay"
+            "recommended_use": "Agentic coding, terminal tasks, autonomous code execution"
         },
         {
             "id": "phi3:latest",

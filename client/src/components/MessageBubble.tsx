@@ -34,11 +34,39 @@ function formatDuration(ms?: number): string {
 }
 
 // Regex to strip raw chat template control tokens emitted by buggy model tags
-const TEMPLATE_TOKENS_REGEX = /<assistant>|<\/assistant>|<user>|<\/user>|<system>|<\/system>|<prompt>|<\/prompt>|\[INST\]|\[\/INST\]/gi;
+const TEMPLATE_TOKENS_REGEX = /<assistant>|<\/assistant>|<user>|<\/user>|<system>|<\/system>|<prompt>|<\/prompt>|\[INST\]|\[\/INST\]|<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>/gi;
+
+// Trailing partial control tokens that commonly leak at the end of streams
+const TRAILING_PARTIAL_TOKENS = [
+  /<\/assistant_?r?e?s?p?o?n?s?e?$/i,
+  /<\/assistant?$/i,
+  /<\/assistan$/i,
+  /<\/assista$/i,
+  /<\/assist$/i,
+  /<\/assis$/i,
+  /<\/ass$/i,
+  /<\/as$/i,
+  /<\/a$/i,
+  /<\/user?$/i,
+  /<\/system?$/i,
+  /\[\/inst?$/i,
+  /<\|im_end?$/i,
+  /<\|im_?$/i,
+  /<\|endoftext?$/i,
+];
+
+function cleanModelOutput(text: string): string {
+  if (!text) return '';
+  let cleaned = text.replace(TEMPLATE_TOKENS_REGEX, '');
+  for (const regex of TRAILING_PARTIAL_TOKENS) {
+    cleaned = cleaned.replace(regex, '');
+  }
+  return cleaned;
+}
 
 export function MessageBubble({ message, isStreaming }: Props) {
   const { role, content, toolName, timestamp, durationMs, durationLabel } = message;
-  const cleanedContent = content.replace(TEMPLATE_TOKENS_REGEX, '');
+  const cleanedContent = cleanModelOutput(content);
 
   if (role === 'system') {
     return (
