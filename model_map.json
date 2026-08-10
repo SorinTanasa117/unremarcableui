@@ -75,7 +75,7 @@
             "capabilities": {
                 "vision": false,
                 "function_calling": true,
-                "thinking_mode": true,
+                "thinking_mode": false,
                 "uncensored": false
             },
             "thinking_config": {

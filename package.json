@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n SERVER,CLIENT -c cyan,magenta \"node --env-file-if-exists=.env --import tsx/esm --watch server/index.ts\" \"vite --port 5174\"",
-    "dev:server": "node --env-file-if-exists=.env --import tsx/esm --watch server/index.ts",
+    "dev": "concurrently -k -n SERVER,CLIENT -c cyan,magenta \"tsx watch server/index.ts\" \"vite --port 5174\"",
+    "dev:server": "tsx watch server/index.ts",
     "dev:client": "vite --port 5174",
     "build": "vite build client",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"

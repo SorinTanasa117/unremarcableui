@@ -65,7 +65,7 @@ function cleanModelOutput(text: string): string {
 }
 
 export function MessageBubble({ message, isStreaming }: Props) {
-  const { role, content, toolName, timestamp, durationMs, durationLabel } = message;
+  const { role, content, thinking, toolName, timestamp, durationMs, durationLabel } = message;
   const cleanedContent = cleanModelOutput(content);
 
   if (role === 'system') {
@@ -152,6 +152,37 @@ export function MessageBubble({ message, isStreaming }: Props) {
           lineHeight: 1.7,
           wordBreak: 'break-word',
         }}>
+          {!isUser && thinking && (
+            <div style={{
+              marginBottom: content ? 10 : 0,
+              padding: '8px 10px',
+              borderRadius: 'var(--radius-md)',
+              background: 'rgba(124,106,247,0.08)',
+              border: '1px solid rgba(124,106,247,0.2)',
+              color: 'var(--text-secondary)',
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}>
+              <div style={{
+                marginBottom: 5,
+                color: 'var(--accent-light)',
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: '0.08em',
+                textTransform: 'uppercase',
+              }}>
+                Thinking process
+              </div>
+              <pre style={{
+                margin: 0,
+                whiteSpace: 'pre-wrap',
+                overflowWrap: 'anywhere',
+                font: 'inherit',
+              }}>
+                {thinking}
+              </pre>
+            </div>
+          )}
           {isUser ? (
             <span style={{ whiteSpace: 'pre-wrap' }}>{cleanedContent}</span>
           ) : (

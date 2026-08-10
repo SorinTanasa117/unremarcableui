@@ -306,10 +306,10 @@ ${quotesStr || '- No direct quotes extracted.'}`;
 
 /**
  * Some reasoning models emit their chain of thought in `content` rather than
- * Ollama's separate `thinking` field. Remove those tags before content reaches
- * the browser or is retained in session history.
+ * Ollama's separate `thinking` field. Remove those tags from answer content
+ * while forwarding their inner text through the thinking callback.
  */
-function createVisibleContentFilter() {
+function createVisibleContentFilter(onThinking?: (content: string) => void) {
   let insideThink = false;
   let pending = '';
   const openTag = '<think>';
@@ -325,9 +325,12 @@ function createVisibleContentFilter() {
       if (insideThink) {
         const closeAt = lower.indexOf(closeTag);
         if (closeAt < 0) {
-          pending = input.slice(-(closeTag.length - 1));
+          const safeLength = Math.max(0, input.length - (closeTag.length - 1));
+          if (safeLength > 0) onThinking?.(input.slice(0, safeLength));
+          pending = input.slice(safeLength);
           return visible;
         }
+        if (closeAt > 0) onThinking?.(input.slice(0, closeAt));
         input = input.slice(closeAt + closeTag.length);
         insideThink = false;
         continue;
@@ -347,7 +350,16 @@ function createVisibleContentFilter() {
     return visible;
   };
 
-  filter.flush = (): string => insideThink ? '' : pending;
+  filter.flush = (): string => {
+    if (insideThink) {
+      if (pending) onThinking?.(pending);
+      pending = '';
+      return '';
+    }
+    const flushed = pending;
+    pending = '';
+    return flushed;
+  };
   return filter;
 }
 
@@ -1083,7 +1095,20 @@ router.post('/chat', async (req: Request, res: Response) => {
       let assistantContent = '';
       let assistantThinking = '';
       const pendingToolCalls: any[] = [];
-      const visibleContent = createVisibleContentFilter();
+      const appendThinking = (content: string) => {
+        if (!content) return;
+        assistantThinking += content;
+        if (!caveman) {
+          send('thinking', { content });
+        }
+        send('tokens', requestCtx.getTokenUsage([{
+          role: 'assistant',
+          content: assistantContent,
+          thinking: assistantThinking,
+          tool_calls: pendingToolCalls,
+        }]));
+      };
+      const visibleContent = createVisibleContentFilter(appendThinking);
 
       const reader = ollamaResp.body!.getReader();
       const decoder = new TextDecoder();
@@ -1119,13 +1144,7 @@ router.post('/chat', async (req: Request, res: Response) => {
 
           if (msg.thinking) {
             markGenerationStarted();
-            assistantThinking += msg.thinking;
-            send('tokens', requestCtx.getTokenUsage([{
-              role: 'assistant',
-              content: assistantContent,
-              thinking: assistantThinking,
-              tool_calls: pendingToolCalls,
-            }]));
+            appendThinking(msg.thinking);
           }
 
           if (msg.tool_calls?.length) {
@@ -1161,7 +1180,7 @@ router.post('/chat', async (req: Request, res: Response) => {
       const assistantMsg: Message = {
         role: 'assistant',
         content: assistantContent,
-        thinking: assistantThinking || undefined,
+        thinking: !caveman && assistantThinking ? assistantThinking : undefined,
         tool_calls: pendingToolCalls.length > 0 ? pendingToolCalls : undefined,
         created_at: Date.now(),
       };

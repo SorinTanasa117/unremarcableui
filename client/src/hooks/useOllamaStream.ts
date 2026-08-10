@@ -7,6 +7,7 @@ export interface ChatMessage {
   id: string;
   role: MessageRole;
   content: string;
+  thinking?: string;
   isActivity?: boolean;
   durationLabel?: string;
   toolName?: string;
@@ -263,6 +264,17 @@ export function useOllamaStream(): UseOllamaStreamReturn {
     return () => window.clearInterval(intervalId);
   }, []);
 
+  const appendThinking = useCallback((chunk: string) => {
+    const id = activeAssistantId.current;
+    const sessionId = streamSessionId.current;
+    if (!id || !sessionId || !chunk) return;
+    updateSessionMessages(sessionId, (messages) => messages.map((message) =>
+      message.id === id
+        ? { ...message, thinking: `${message.thinking ?? ''}${chunk}` }
+        : message
+    ));
+  }, [updateSessionMessages]);
+
   const appendToken = useCallback((token: string) => {
     const id = activeAssistantId.current;
     const sessionId = streamSessionId.current;
@@ -348,6 +360,7 @@ export function useOllamaStream(): UseOllamaStreamReturn {
             return {
               id: m.tool_call_id || uid(),
               role: roleMap[m.role] || 'assistant',
+              thinking: m.role === 'assistant' ? (m.thinking || undefined) : undefined,
               content: m.role === 'tool'
                 ? completedStepLabel(
                     savedToolName(sessionMessages, index) ?? 'tool',
@@ -562,6 +575,10 @@ export function useOllamaStream(): UseOllamaStreamReturn {
 
             case 'token':
               appendToken(data.content);
+              break;
+
+            case 'thinking':
+              appendThinking(data.content);
               break;
 
             case 'tool_start': {
