@@ -36,11 +36,15 @@ function FileNode({ node, depth, onSelect, selectedPath, folderOpenState, onFold
   onFolderOpenChange: (path: string, open: boolean) => void;
 }) {
   const isDir = node.type === 'directory';
-  // Default collapsed: folders stay closed unless the user has explicitly
-  // toggled them. Their open/closed state is owned by App.tsx (so it survives
-  // tab switches between Editor/Terminal/Files/Novel) and is also persisted
-  // to localStorage so a page reload restores the user's last view.
-  const open = isDir ? (folderOpenState[node.path] ?? false) : false;
+  // Default behavior:
+  //   - The root level (depth 0) is open by default so newly created
+  //     top-level folders/files are immediately visible to the user.
+  //   - All other levels stay collapsed unless the user has explicitly
+  //     toggled them. Their open/closed state is owned by App.tsx (so it
+  //     survives tab switches between Editor/Terminal/Files/Novel) and is
+  //     also persisted to localStorage so a page reload restores the
+  //     user's last view.
+  const open = isDir ? (folderOpenState[node.path] ?? depth === 0) : false;
   const isSelected = node.path === selectedPath;
 
   return (
@@ -96,7 +100,7 @@ function FileNode({ node, depth, onSelect, selectedPath, folderOpenState, onFold
 }
 
 export function FileExplorer({ onSelectFile, selectedPath, folderOpenState, onFolderOpenChange }: Props) {
-  const { tree, isLoading, refetch } = useFileSystem();
+  const { tree, isLoading, isRefreshing, refetch } = useFileSystem();
 
   return (
     <div className="flex-col" style={{ height: '100%', display: 'flex' }}>
@@ -106,8 +110,16 @@ export function FileExplorer({ onSelectFile, selectedPath, folderOpenState, onFo
         </span>
         <button
           className="btn btn-icon"
-          style={{ width: 24, height: 24, padding: 0, fontSize: 13, border: 'none', background: 'none', color: 'var(--text-muted)' }}
-          onClick={() => refetch()}
+          style={{
+            width: 24, height: 24, padding: 0,
+            fontSize: 13, border: 'none', background: 'none',
+            color: isRefreshing ? 'var(--accent-light)' : 'var(--text-muted)',
+            cursor: isRefreshing ? 'progress' : 'pointer',
+            transition: 'color 0.15s, transform 0.4s',
+            transform: isRefreshing ? 'rotate(360deg)' : 'rotate(0deg)',
+          }}
+          onClick={() => { refetch(); }}
+          disabled={isRefreshing}
           title="Refresh"
         >
           ↻

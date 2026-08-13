@@ -1,6 +1,8 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useCallback } from 'react';
 
 export function useFileSystem(watchInterval = 2000) {
+  const queryClient = useQueryClient();
   const tree = useQuery({
     queryKey: ['file-tree'],
     queryFn: async () => {
@@ -25,6 +27,7 @@ export function useFileSystem(watchInterval = 2000) {
       body: JSON.stringify({ path, content }),
     });
     if (!res.ok) throw new Error('Failed to write file');
+    queryClient.invalidateQueries({ queryKey: ['file-tree'] });
   };
 
   const deleteFile = async (path: string): Promise<void> => {
@@ -32,8 +35,26 @@ export function useFileSystem(watchInterval = 2000) {
       method: 'DELETE',
     });
     if (!res.ok) throw new Error('Failed to delete file');
-    tree.refetch();
+    queryClient.invalidateQueries({ queryKey: ['file-tree'] });
   };
 
-  return { tree: tree.data ?? [], isLoading: tree.isLoading, readFile, writeFile, deleteFile, refetch: tree.refetch };
+  // Hard refetch: bust the cache and force a network call. This always hits
+  // the server even when the data is fresh, so the refresh button reliably
+  // pulls newly created files / folders into the UI.
+  const refetch = useCallback(() => {
+    return queryClient.invalidateQueries({
+      queryKey: ['file-tree'],
+      refetchType: 'active',
+    });
+  }, [queryClient]);
+
+  return {
+    tree: tree.data ?? [],
+    isLoading: tree.isLoading,
+    isRefreshing: tree.isFetching,
+    readFile,
+    writeFile,
+    deleteFile,
+    refetch,
+  };
 }

@@ -9,6 +9,7 @@ import { ProgressBar } from './components/ProgressBar';
 import { NovelStudio } from './components/NovelStudio';
 import { useOllamaStream, type InferenceBackend } from './hooks/useOllamaStream';
 import { formatTokenRate } from './lib/tokenCounter';
+import { playChime, unlockAudio } from './lib/chime';
 
 function generateSessionId() {
   return `session_${Math.random().toString(36).slice(2, 11)}`;
@@ -51,6 +52,7 @@ export default function App() {
   const [thinkingMode, setThinkingMode] = useState(false);
   const [numThread, setNumThread] = useState(() => Number(localStorage.getItem('ollama_num_thread')) === 8 ? 8 : 6);
   const [cavemanMode, setCavemanMode] = useState(() => localStorage.getItem('ollama_caveman_mode') === 'true');
+  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem('ollama_sound_enabled') !== 'false');
   const [modelMap, setModelMap] = useState<any>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   // Folder open/closed state lives at the App root so it is preserved when the
@@ -120,7 +122,8 @@ export default function App() {
   const newSessionPersonas = useRef(new Map<string, PersonaType>());
   const newSessionModels = useRef(new Map<string, string>());
 
-  // Layout states: Sidebar (left) and Panel (right) are toggleable.
+  // Left sidebar and right tools panel collapse via slim switches built
+  // into their edges (Alt+C / Alt+T also work).
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
   const [rightPanelTab, setRightPanelTab] = useState<RightTab>('terminal');
@@ -163,6 +166,24 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('ollama_inference_backend', inferenceBackend);
   }, [inferenceBackend]);
+
+  useEffect(() => {
+    localStorage.setItem('ollama_sound_enabled', String(soundEnabled));
+  }, [soundEnabled]);
+
+  // Play a soft chime when a streaming session reaches a terminal state.
+  // Only fires on the transition out of an active run — page loads and
+  // session switches do not retrigger it.
+  const prevStatusRef = useRef<typeof status>(status);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    const wasActive = prev === 'thinking' || prev === 'tool';
+    const nowTerminal = status === 'idle' || status === 'stopped' || status === 'error';
+    if (wasActive && nowTerminal && soundEnabled) {
+      playChime();
+    }
+    prevStatusRef.current = status;
+  }, [status, soundEnabled]);
 
   // Load selected session history and restore its active persona and model.
   useEffect(() => {
@@ -455,22 +476,22 @@ export default function App() {
       {/* ── Main Body ── */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
 
-        {/* Left Sidebar — always present; collapse tab on its right edge */}
+        {/* Left Sidebar — collapse switch on its right edge */}
         <div style={{
           display: 'flex',
           flexShrink: 0,
           position: 'relative',
         }}>
-          {/* Sidebar content */}
           {sidebarOpen && (
             <aside style={{
               width: 230,
-              display: 'flex',
-              flexDirection: 'column',
-              borderRight: '1px solid var(--border)',
-              background: 'var(--bg-surface)',
-              overflow: 'hidden',
-            }}>
+          display: 'flex',
+          flexDirection: 'column',
+          flexShrink: 0,
+          borderRight: '1px solid var(--border)',
+          background: 'var(--bg-surface)',
+          overflow: 'hidden',
+        }}>
               {/* New Chat Button (split with persona selectors) */}
               <div style={{ padding: 12, borderBottom: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 6 }}>
                 <button
@@ -567,37 +588,92 @@ export default function App() {
                   );
                 })}
               </div>
+
+              {/* Sound toggle at bottom of sidebar */}
+              <div style={{
+                padding: '10px 12px',
+                borderTop: '1px solid var(--border)',
+                background: 'var(--bg-surface)',
+                flexShrink: 0,
+              }}>
+                <label
+                  className="flex items-center justify-between"
+                  style={{
+                    fontSize: 12,
+                    color: 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                  }}
+                  onClick={() => {
+                    // Unlock the audio context on first user interaction so
+                    // subsequent end-of-session chimes can play under browser
+                    // autoplay policies.
+                    unlockAudio();
+                    setSoundEnabled((prev) => !prev);
+                  }}
+                  title="Play a soft chime when a session finishes"
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontSize: 13 }}>{soundEnabled ? '🔔' : '🔕'}</span>
+                    <span>Session end sound</span>
+                  </span>
+                  <span
+                    style={{
+                      width: 30,
+                      height: 16,
+                      borderRadius: 10,
+                      background: soundEnabled ? 'var(--accent)' : 'var(--bg-card)',
+                      border: '1px solid var(--border)',
+                      position: 'relative',
+                      transition: 'background 0.2s',
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span
+                      style={{
+                        position: 'absolute',
+                        top: 1,
+                        left: soundEnabled ? 14 : 1,
+                        width: 12,
+                        height: 12,
+                        borderRadius: '50%',
+                        background: soundEnabled ? 'var(--bg-surface)' : 'var(--text-muted)',
+                        transition: 'left 0.2s, background 0.2s',
+                      }}
+                    />
+                  </span>
+                </label>
+              </div>
             </aside>
           )}
 
-          {/* Collapse tab — right edge of sidebar */}
+          {/* Collapse switch — right edge of sidebar */}
           <button
             onClick={() => setSidebarOpen((o) => !o)}
-            title={sidebarOpen ? 'Collapse chats (Alt+C)' : 'Open chats (Alt+C)'}
+            title={sidebarOpen ? 'Hide chats (Alt+C)' : 'Show chats (Alt+C)'}
+            aria-label={sidebarOpen ? 'Hide chats' : 'Show chats'}
             style={{
-              width: 18,
+              width: 16,
               display: 'flex',
               flexDirection: 'column',
               alignItems: 'center',
               justifyContent: 'center',
-              gap: 6,
+              gap: 4,
               background: 'var(--bg-surface)',
+              border: 'none',
               borderRight: '1px solid var(--border)',
-              borderLeft: 'none',
-              borderTop: 'none',
-              borderBottom: 'none',
               cursor: 'pointer',
               color: 'var(--text-muted)',
               fontSize: 9,
-              padding: '0 2px',
+              padding: '4px 0',
               transition: 'color 0.15s, background 0.15s',
               flexShrink: 0,
             }}
             onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; e.currentTarget.style.background = 'var(--bg-hover)'; }}
             onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--bg-surface)'; }}
           >
-            <span style={{ fontSize: 11 }}>💬</span>
-            <span style={{ fontSize: 10 }}>{sidebarOpen ? '◀' : '▶'}</span>
+            <span style={{ fontSize: 11, lineHeight: 1 }}>💬</span>
+            <span style={{ fontSize: 10, lineHeight: 1 }}>{sidebarOpen ? '◀' : '▶'}</span>
           </button>
         </div>
 
@@ -620,8 +696,8 @@ export default function App() {
               numThread={numThread}
               inferenceBackend={inferenceBackend}
               cavemanMode={cavemanMode}
-              sidebarOpen={sidebarOpen}
-              rightPanelOpen={rightPanelOpen}
+              sidebarOpen={true}
+              rightPanelOpen={true}
               hasNovelOutline={novelOutlineReady}
               onStartChapter={() => {
                 if (!novelFirstChapter) return;
@@ -638,45 +714,48 @@ export default function App() {
             />
           </div>
 
-          {/* Right Panel: always-present; collapse tab on its left edge */}
-          <div style={{ display: 'flex', flexShrink: 0, borderLeft: '1px solid var(--border)' }}>
-            {/* Collapse tab — left edge of right panel */}
+          {/* Right Panel: collapse switch on its left edge */}
+          <div style={{
+            display: 'flex',
+            flexShrink: 0,
+          }}>
             <button
               onClick={() => setRightPanelOpen((o) => !o)}
-              title={rightPanelOpen ? 'Collapse workspace tools (Alt+T)' : 'Open workspace tools (Alt+T)'}
+              title={rightPanelOpen ? 'Hide tools (Alt+T)' : 'Show tools (Alt+T)'}
+              aria-label={rightPanelOpen ? 'Hide tools' : 'Show tools'}
               style={{
-                width: 18,
+                width: 16,
                 display: 'flex',
                 flexDirection: 'column',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: 6,
+                gap: 4,
                 background: 'var(--bg-surface)',
                 border: 'none',
                 borderRight: '1px solid var(--border)',
                 cursor: 'pointer',
                 color: 'var(--text-muted)',
                 fontSize: 9,
-                padding: '0 2px',
+                padding: '4px 0',
                 transition: 'color 0.15s, background 0.15s',
                 flexShrink: 0,
               }}
               onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; e.currentTarget.style.background = 'var(--bg-hover)'; }}
               onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'var(--bg-surface)'; }}
             >
-              <span style={{ fontSize: 10 }}>{rightPanelOpen ? '▶' : '◀'}</span>
-              <span style={{ fontSize: 11 }}>⊞</span>
+              <span style={{ fontSize: 10, lineHeight: 1 }}>{rightPanelOpen ? '▶' : '◀'}</span>
+              <span style={{ fontSize: 11, lineHeight: 1 }}>⊞</span>
             </button>
 
-            {/* Panel content */}
             <div style={{
-                width: rightPanelOpen ? '50vw' : 0,
-                minWidth: rightPanelOpen ? 400 : 0,
-                display: 'flex',
-                flexDirection: 'column',
-                overflow: 'hidden',
-                background: 'var(--bg-surface)',
-              }}>
+              display: rightPanelOpen ? 'flex' : 'none',
+              width: '50vw',
+              minWidth: 400,
+              flexDirection: 'column',
+              overflow: 'hidden',
+              background: 'var(--bg-surface)',
+              borderLeft: '1px solid var(--border)',
+            }}>
                 {/* Tab headers */}
                 <div style={{
                   display: 'flex',
@@ -761,8 +840,8 @@ export default function App() {
                       }}
                     />
                   </div>
-                </div>
               </div>
+            </div>
           </div>
         </div>
       </div>

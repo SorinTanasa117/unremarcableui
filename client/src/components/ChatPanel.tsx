@@ -259,28 +259,6 @@ export function ChatPanel({
             <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
               {model || 'No model selected'}
             </span>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>•</span>
-            <button
-              style={{
-                background: 'none', border: 'none', color: 'var(--text-secondary)',
-                fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3
-              }}
-              onClick={onToggleSidebar}
-              title="Toggle Chats List (Alt+C)"
-            >
-              {sidebarOpen ? '← Hide Chats' : '→ Show Chats'}
-            </button>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>•</span>
-            <button
-              style={{
-                background: 'none', border: 'none', color: 'var(--text-secondary)',
-                fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 3
-              }}
-              onClick={onToggleRightPanel}
-              title="Toggle Workspace Tools (Alt+T)"
-            >
-              {rightPanelOpen ? 'Hide Tools →' : 'Show Tools ←'}
-            </button>
           </div>
           <button
             style={{
