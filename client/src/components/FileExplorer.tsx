@@ -36,7 +36,11 @@ function FileNode({ node, depth, onSelect, selectedPath, folderOpenState, onFold
   onFolderOpenChange: (path: string, open: boolean) => void;
 }) {
   const isDir = node.type === 'directory';
-  const open = isDir ? (folderOpenState[node.path] ?? depth < 2) : false;
+  // Default collapsed: folders stay closed unless the user has explicitly
+  // toggled them. Their open/closed state is owned by App.tsx (so it survives
+  // tab switches between Editor/Terminal/Files/Novel) and is also persisted
+  // to localStorage so a page reload restores the user's last view.
+  const open = isDir ? (folderOpenState[node.path] ?? false) : false;
   const isSelected = node.path === selectedPath;
 
   return (

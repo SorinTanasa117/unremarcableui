@@ -67,6 +67,21 @@
             "recommended_use": "Full codebase engineering, complex script generation, repository editing"
         },
         {
+            "id": "smollm2:latest",
+            "name": "SmolLM2 1.7B",
+            "size_gb": 1.5,
+            "max_context": 8192,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": false,
+                "uncensored": false
+            },
+            "system_prompt_type": "chatml",
+            "recommended_use": "Ultra-lightweight tool calling, fast classification, low-RAM agent tasks"
+        },
+        {
             "id": "North-Mini-Code-1-0-GGUF:latest",
             "name": "North Mini Code 1.0",
             "size_gb": 18.7,
@@ -210,6 +225,25 @@
             },
             "system_prompt_type": "chatml",
             "recommended_use": "Agent orchestration, structured workflow execution, multi-tool planning"
+        },
+        {
+            "id": "nemotron-3.5-lightning:latest",
+            "name": "NVIDIA Nemotron 3.5 Lightning 30B (MoE, 3B active)",
+            "size_gb": 18.0,
+            "max_context": 262144,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
+                "function_calling": true,
+                "thinking_mode": true,
+                "uncensored": false
+            },
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
+            },
+            "system_prompt_type": "chatml",
+            "recommended_use": "Always-on agent execution, high-volume tool calls, long-running autonomous workflows"
         },
         {
             "id": "gemma4:26b-uncensored",

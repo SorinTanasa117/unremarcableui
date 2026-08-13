@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import ollamaRouter from './routes/ollama.js';
 import filesRouter from './routes/files.js';
 import toolsRouter from './routes/tools.js';
+import novelsRouter from './routes/novels.js';
 import { setupTerminalWS } from './routes/terminal.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -26,6 +27,7 @@ app.use((req, _res, next) => {
 app.use('/api/ollama', ollamaRouter);
 app.use('/api/files', filesRouter);
 app.use('/api/tools', toolsRouter);
+app.use('/api/novels', novelsRouter);
 
 // Health check
 app.get('/api/health', (_req, res) => res.json({ ok: true }));

@@ -24,6 +24,7 @@ export interface ToolEvent {
 }
 
 export type AgentStatus = 'idle' | 'thinking' | 'tool' | 'stopped' | 'error';
+export type InferenceBackend = 'ollama' | 'llamacpp';
 
 export interface ChatSessionInfo {
   sessionId: string;
@@ -58,6 +59,8 @@ export interface SendMessageOptions {
   isolated?: boolean;
   numCtx?: number;
   think?: boolean;
+  numThread?: number;
+  inferenceBackend?: InferenceBackend;
   /** Caveman mode — compress every reply, same technical content, fewer tokens. */
   caveman?: boolean;
 }
@@ -90,7 +93,7 @@ interface UseOllamaStreamReturn {
   tokenRates: TokenRates;
   sendMessage: (content: string, model: string, sessionId: string, persona: string, options?: SendMessageOptions) => void;
   stop: (sessionId: string) => void;
-  killModel: (model: string) => Promise<void>;
+  killModel: (model: string, inferenceBackend: InferenceBackend) => Promise<void>;
   resetSession: (sessionId: string) => void;
   currentTool: ToolEvent | null;
   loadSessionHistory: (sessionId: string) => Promise<SessionLoadResult>;
@@ -524,7 +527,18 @@ export function useOllamaStream(): UseOllamaStreamReturn {
       const res = await fetch('/api/ollama/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId, model, message: content, persona, isolated: options.isolated, numCtx: options.numCtx, think: options.think, caveman: options.caveman }),
+        body: JSON.stringify({
+          sessionId,
+          model,
+          message: content,
+          persona,
+          isolated: options.isolated,
+          numCtx: options.numCtx,
+          think: options.think,
+          numThread: options.numThread,
+          inferenceBackend: options.inferenceBackend ?? 'ollama',
+          caveman: options.caveman,
+        }),
         signal: controller.signal,
       });
 
@@ -572,6 +586,10 @@ export function useOllamaStream(): UseOllamaStreamReturn {
               setStatusText('Thinking…');
               break;
             }
+
+            case 'status':
+              setStatusText(data.message ?? '');
+              break;
 
             case 'token':
               appendToken(data.content);
@@ -701,11 +719,13 @@ export function useOllamaStream(): UseOllamaStreamReturn {
             case 'error':
               setStatus('error');
               setStatusText(data.message ?? 'Error');
+              streamSessionId.current = null;
+              setCurrentTool(null);
               activeAssistantId.current = '';
               resetTokenRates();
               updateSessionMessages(sessionId, (messages) => [...messages, {
                 id: uid(), role: 'system',
-                content: `⚠️ Error: ${data.message}`,
+                content: `⚠️ Error: ${data.message}. Restart the model if needed, then continue the chat — your conversation has been saved.`,
                 timestamp: Date.now(),
               }]);
               break;
@@ -716,6 +736,8 @@ export function useOllamaStream(): UseOllamaStreamReturn {
       if (err.name !== 'AbortError') {
         setStatus('error');
         setStatusText(err.message);
+        streamSessionId.current = null;
+        setCurrentTool(null);
       } else {
         setStatus('stopped');
         setStatusText('Stopped');
@@ -723,7 +745,7 @@ export function useOllamaStream(): UseOllamaStreamReturn {
       activeAssistantId.current = '';
       resetTokenRates();
       updateSessionMessages(sessionId, (messages) => [...messages, {
-        id: uid(), role: 'system', content: `⚠️ Error: ${err.message}`, timestamp: Date.now(),
+        id: uid(), role: 'system', content: `⚠️ Error: ${err.message}. Restart the model if needed, then continue the chat.`, timestamp: Date.now(),
       }]);
     }
   }, [appendToken, addAssistantBubble, fetchSessionsList, updateSessionMessages, updateSessionTokens, resetTokenRates]);
@@ -741,13 +763,13 @@ export function useOllamaStream(): UseOllamaStreamReturn {
     resetTokenRates();
   }, [resetTokenRates]);
 
-  const killModel = useCallback(async (model: string) => {
+  const killModel = useCallback(async (model: string, inferenceBackend: InferenceBackend) => {
     if (!model) return;
     try {
       const res = await fetch('/api/ollama/unload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model }),
+        body: JSON.stringify({ model, inferenceBackend }),
       });
       if (!res.ok) throw new Error(`Unable to unload model (${res.status})`);
       setStatus('stopped');

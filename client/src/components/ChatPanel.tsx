@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback, KeyboardEvent } from 'react';
 import { MessageBubble } from './MessageBubble';
 import { StoryStudio } from './StoryStudio';
-import type { ChatMessage, AgentStatus, SendMessageOptions } from '../hooks/useOllamaStream';
+import type { ChatMessage, AgentStatus, SendMessageOptions, InferenceBackend } from '../hooks/useOllamaStream';
 
 interface Props {
   model: string;
@@ -10,14 +10,18 @@ interface Props {
   status: AgentStatus;
   sendMessage: (content: string, model: string, sessionId: string, persona: string, options?: SendMessageOptions) => void;
   stop: (sessionId: string) => void;
-  killModel: (model: string) => Promise<void>;
+  killModel: (model: string, inferenceBackend: InferenceBackend) => Promise<void>;
   resetSession: (sessionId: string) => void;
   persona: string;
   contextSize: number;
   thinkingMode: boolean;
+  numThread: number;
+  inferenceBackend: InferenceBackend;
   cavemanMode: boolean;
   sidebarOpen: boolean;
   rightPanelOpen: boolean;
+  hasNovelOutline: boolean;
+  onStartChapter: () => void;
   onToggleSidebar: () => void;
   onToggleRightPanel: () => void;
 }
@@ -34,9 +38,13 @@ export function ChatPanel({
   persona,
   contextSize,
   thinkingMode,
+  numThread,
+  inferenceBackend,
   cavemanMode,
   sidebarOpen,
   rightPanelOpen,
+  hasNovelOutline,
+  onStartChapter,
   onToggleSidebar,
   onToggleRightPanel,
 }: Props) {
@@ -45,6 +53,7 @@ export function ChatPanel({
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isRunning = status === 'thinking' || status === 'tool';
+  const showStartChapter = persona === 'novelist' && hasNovelOutline;
 
   useEffect(() => {
     if (persona !== 'creative') setStoryMode(false);
@@ -67,8 +76,14 @@ export function ChatPanel({
     const text = input.trim();
     if (!text || !model || isRunning) return;
     setInput('');
-    sendMessage(text, model, sessionId, persona, { numCtx: contextSize, think: thinkingMode, caveman: cavemanMode });
-  }, [input, isRunning, model, sessionId, sendMessage, persona, contextSize, thinkingMode, cavemanMode]);
+    sendMessage(text, model, sessionId, persona, {
+      numCtx: contextSize,
+      think: thinkingMode,
+      numThread,
+      inferenceBackend,
+      caveman: cavemanMode,
+    });
+  }, [input, isRunning, model, sessionId, sendMessage, persona, contextSize, thinkingMode, numThread, inferenceBackend, cavemanMode]);
 
   const handleKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -99,7 +114,14 @@ export function ChatPanel({
           messages={messages}
           status={status}
           modelAvailable={Boolean(model)}
-          onGenerate={(prompt) => sendMessage(prompt, model, sessionId, persona, { isolated: true, numCtx: contextSize, think: thinkingMode, caveman: cavemanMode })}
+          onGenerate={(prompt) => sendMessage(prompt, model, sessionId, persona, {
+            isolated: true,
+            numCtx: contextSize,
+            think: thinkingMode,
+            numThread,
+            inferenceBackend,
+            caveman: cavemanMode,
+          })}
         />
       ) : <>
       {/* Messages */}
@@ -197,6 +219,16 @@ export function ChatPanel({
               >
                 ■
               </button>
+            ) : showStartChapter ? (
+              <button
+                className="btn btn-primary"
+                onClick={onStartChapter}
+                disabled={!model}
+                title="Start first unwritten chapter"
+                style={{ whiteSpace: 'nowrap' }}
+              >
+                ▶ Start chapter
+              </button>
             ) : (
               <button
                 className="btn btn-primary btn-icon"
@@ -209,7 +241,7 @@ export function ChatPanel({
             )}
             <button
               className="btn btn-icon"
-              onClick={() => void killModel(model)}
+              onClick={() => void killModel(model, inferenceBackend)}
               disabled={!model}
               title="Eject model from memory"
               style={{ color: 'var(--amber)', borderColor: 'rgba(245,166,35,0.45)' }}

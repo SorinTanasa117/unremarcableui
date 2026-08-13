@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ChatPanel } from './components/ChatPanel';
 import { FileExplorer } from './components/FileExplorer';
 import { FileEditor } from './components/FileEditor';
@@ -6,21 +6,24 @@ import { TerminalPane } from './components/TerminalPane';
 import { ModelSelector } from './components/ModelSelector';
 import { StatusIndicator } from './components/StatusIndicator';
 import { ProgressBar } from './components/ProgressBar';
-import { useOllamaStream } from './hooks/useOllamaStream';
+import { NovelStudio } from './components/NovelStudio';
+import { useOllamaStream, type InferenceBackend } from './hooks/useOllamaStream';
 import { formatTokenRate } from './lib/tokenCounter';
 
 function generateSessionId() {
   return `session_${Math.random().toString(36).slice(2, 11)}`;
 }
 
-type RightTab = 'editor' | 'terminal' | 'files';
-type PersonaType = 'coder' | 'researcher' | 'creative';
+type RightTab = 'editor' | 'terminal' | 'files' | 'novel';
+type PersonaType = 'coder' | 'researcher' | 'creative' | 'system' | 'novelist';
 const CONTEXT_SIZES = [16_384, 32_768, 65_536, 131_072, 262_144];
 
 const personaBadges: Record<PersonaType, { label: string; color: string }> = {
   coder: { label: 'Coder', color: 'var(--blue)' },
   researcher: { label: 'Researcher', color: 'var(--green)' },
   creative: { label: 'Creative', color: 'var(--amber)' },
+  system: { label: 'System', color: 'var(--purple)' },
+  novelist: { label: 'Novelist', color: 'var(--teal, #14b8a6)' },
 };
 
 export default function App() {
@@ -41,12 +44,37 @@ export default function App() {
   } = useOllamaStream();
 
   const [model, setModel] = useState('');
+  const [inferenceBackend, setInferenceBackend] = useState<InferenceBackend>(() =>
+    localStorage.getItem('ollama_inference_backend') === 'llamacpp' ? 'llamacpp' : 'ollama'
+  );
   const [contextSize, setContextSize] = useState(() => Number(localStorage.getItem('ollama_context_size')) || 32_768);
   const [thinkingMode, setThinkingMode] = useState(false);
+  const [numThread, setNumThread] = useState(() => Number(localStorage.getItem('ollama_num_thread')) === 8 ? 8 : 6);
   const [cavemanMode, setCavemanMode] = useState(() => localStorage.getItem('ollama_caveman_mode') === 'true');
   const [modelMap, setModelMap] = useState<any>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [folderOpenState, setFolderOpenState] = useState<Record<string, boolean>>({});
+  // Folder open/closed state lives at the App root so it is preserved when the
+  // user switches between the right-panel tabs (Editor / Terminal / Files /
+  // Novel). It is also persisted to localStorage so the tree reopens exactly
+  // as the user left it across reloads. Defaults to fully collapsed.
+  const [folderOpenState, setFolderOpenState] = useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem('ollama_folder_open_state');
+      if (!saved) return {};
+      const parsed = JSON.parse(saved);
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, boolean>) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('ollama_folder_open_state', JSON.stringify(folderOpenState));
+    } catch {
+      // Ignore quota/serialization failures — the in-memory state still works.
+    }
+  }, [folderOpenState]);
 
   // Fetch model map on startup
   useEffect(() => {
@@ -58,6 +86,9 @@ export default function App() {
 
   // Sync thinking mode and context size with the selected model's capabilities
   useEffect(() => {
+    if (inferenceBackend === 'llamacpp') {
+      setThinkingMode(false);
+    }
     if (!modelMap || !model) return;
     const currentModelDef = modelMap.models?.find((m: any) => m.id === model);
     if (!currentModelDef) return;
@@ -66,19 +97,16 @@ export default function App() {
     if (!currentModelDef.capabilities?.thinking_mode) {
       // Model does not support thinking at all — turn it off
       setThinkingMode(false);
-    } else if (currentModelDef.thinking_config?.default_enabled === true) {
-      // Model prefers thinking on by default (e.g. Laguna XS, Nemotron)
-      setThinkingMode(true);
     }
 
     // ── Context size ────────────────────────────────────────────────────────
-    // Always default to the highest valid CONTEXT_SIZES step the model supports.
+    // Adjust contextSize only if current selection exceeds model's max_context
     const modelMax: number | undefined = currentModelDef.max_context;
-    if (modelMax) {
+    if (modelMax && contextSize > modelMax) {
       const best = [...CONTEXT_SIZES].reverse().find((s) => s <= modelMax);
       if (best) setContextSize(best);
     }
-  }, [model, modelMap]);
+  }, [model, modelMap, inferenceBackend, contextSize]);
 
   // Active Session Persistence
   const [activeSessionId, setActiveSessionId] = useState<string>(() => {
@@ -96,6 +124,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
   const [rightPanelTab, setRightPanelTab] = useState<RightTab>('terminal');
+  const [novelOutlineReady, setNovelOutlineReady] = useState(false);
+  const [novelFirstChapter, setNovelFirstChapter] = useState<{ number: number; title: string } | null>(null);
 
   // Hotkeys for toggling sidebars: Alt+C (Chats), Alt+T (Tools)
   useEffect(() => {
@@ -126,6 +156,14 @@ export default function App() {
     localStorage.setItem('ollama_caveman_mode', String(cavemanMode));
   }, [cavemanMode]);
 
+  useEffect(() => {
+    localStorage.setItem('ollama_num_thread', String(numThread));
+  }, [numThread]);
+
+  useEffect(() => {
+    localStorage.setItem('ollama_inference_backend', inferenceBackend);
+  }, [inferenceBackend]);
+
   // Load selected session history and restore its active persona and model.
   useEffect(() => {
     let cancelled = false;
@@ -142,6 +180,11 @@ export default function App() {
     });
     return () => { cancelled = true; };
   }, [activeSessionId, loadSessionHistory]);
+
+  useEffect(() => {
+    setNovelOutlineReady(false);
+    setNovelFirstChapter(null);
+  }, [activeSessionId]);
 
   const handleFileSelect = (path: string) => {
     setSelectedFile(path);
@@ -160,6 +203,41 @@ export default function App() {
     setActivePersona(persona);
     setActiveSessionId(newId);
   };
+
+  const createNovelChat = async (title: string): Promise<string> => {
+    const newId = generateSessionId();
+    const res = await fetch('/api/ollama/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: newId,
+        title: `${title} — Outline`,
+        persona: 'novelist',
+        model,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) {
+      throw new Error(data.error || 'Failed to create dedicated novel chat');
+    }
+    newSessionPersonas.current.set(newId, 'novelist');
+    newSessionModels.current.set(newId, model);
+    await fetchSessionsList();
+    return newId;
+  };
+
+  const activateNovelChat = (sessionId: string) => {
+    setActivePersona('novelist');
+    setActiveSessionId(sessionId);
+  };
+
+  const handleNovelOutlineReady = useCallback((
+    hasOutline: boolean,
+    firstChapter?: { number: number; title: string },
+  ) => {
+    setNovelOutlineReady(hasOutline && Boolean(firstChapter));
+    setNovelFirstChapter(firstChapter ? { number: firstChapter.number, title: firstChapter.title } : null);
+  }, []);
 
   const handleDeleteSession = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
@@ -201,7 +279,21 @@ export default function App() {
         </div>
 
         {/* Model selector */}
-        <ModelSelector value={model} onChange={setModel} disabled={isRunning} persona={activePersona} />
+        <ModelSelector value={model} onChange={setModel} disabled={isRunning} persona={activePersona} backend={inferenceBackend} />
+
+        <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Runtime</span>
+          <select
+            value={inferenceBackend}
+            onChange={(event) => setInferenceBackend(event.target.value as InferenceBackend)}
+            disabled={isRunning}
+            title="Select inference runtime backend"
+            style={{ padding: '5px 8px', fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}
+          >
+            <option value="ollama">Ollama (CPU/Vulkan)</option>
+            <option value="llamacpp">llama.cpp SYCL</option>
+          </select>
+        </div>
 
         {(() => {
           const currentModelDef = modelMap?.models?.find((m: any) => m.id === model);
@@ -247,14 +339,16 @@ export default function App() {
           >
             <option value="coder">💻 Coder</option>
             <option value="researcher">🔍 Researcher</option>
-            <option value="creative">✍ Creative Novelist</option>
+            <option value="creative">✍ Creative</option>
+            <option value="novelist">📖 Novelist</option>
+            <option value="system">⚙ System</option>
           </select>
         </div>
 
         {/* Thinking mode toggle */}
         {(() => {
           const selectedModelDef = modelMap?.models?.find((m: any) => m.id === model);
-          const supportsThinking = selectedModelDef ? (selectedModelDef.capabilities?.thinking_mode ?? false) : true;
+          const supportsThinking = inferenceBackend === 'ollama' && (selectedModelDef ? (selectedModelDef.capabilities?.thinking_mode ?? false) : true);
           return (
             <label
               className="flex items-center gap-2"
@@ -264,7 +358,11 @@ export default function App() {
                 cursor: (isRunning || !supportsThinking) ? 'not-allowed' : 'pointer',
                 opacity: supportsThinking ? 1 : 0.5,
               }}
-              title={supportsThinking ? 'Use model reasoning when supported' : 'Thinking mode not supported by this model'}
+              title={supportsThinking
+                ? 'Use model reasoning when supported'
+                : inferenceBackend === 'llamacpp'
+                  ? 'Thinking mode is disabled on llama.cpp SYCL runtime'
+                  : 'Thinking mode not supported by this model'}
             >
               <input
                 type="checkbox"
@@ -276,6 +374,23 @@ export default function App() {
             </label>
           );
         })()}
+
+        {/* Thread tuning selector */}
+        <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Threads</span>
+          <select
+            value={numThread}
+            onChange={(event) => setNumThread(Number(event.target.value))}
+            disabled={isRunning || inferenceBackend === 'llamacpp'}
+            title={inferenceBackend === 'ollama'
+              ? 'Thread count sent as num_thread on each request'
+              : 'Thread count applies to Ollama runtime only'}
+            style={{ padding: '5px 8px', fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}
+          >
+            <option value={6}>6 (P-core focus)</option>
+            <option value={8}>8 (broader)</option>
+          </select>
+        </div>
 
         {/* Caveman mode toggle */}
         <label
@@ -366,10 +481,17 @@ export default function App() {
                   + New Chat
                 </button>
                 <div style={{ display: 'flex', gap: 4, width: '100%' }}>
-                  {(['coder', 'researcher', 'creative'] as const).map((p) => (
+                  {(['coder', 'researcher', 'creative', 'novelist', 'system'] as const).map((p) => (
                     <button
                       key={p}
-                      onClick={() => startNewChat(p)}
+                      onClick={() => {
+                        if (p === 'novelist') {
+                          setRightPanelTab('novel');
+                          setRightPanelOpen(true);
+                        } else {
+                          startNewChat(p);
+                        }
+                      }}
                       style={{
                         flex: 1,
                         padding: '4px',
@@ -380,11 +502,13 @@ export default function App() {
                         color: 'var(--text-secondary)',
                         cursor: 'pointer',
                       }}
-                      title={`Create new ${p} chat`}
+                      title={p === 'novelist' ? 'Open Novel Studio' : `Create new ${p} chat`}
                     >
                       {p === 'coder' && '💻'}
                       {p === 'researcher' && '🔍'}
                       {p === 'creative' && '✍'}
+                      {p === 'novelist' && '📖'}
+                      {p === 'system' && '⚙'}
                     </button>
                   ))}
                 </div>
@@ -493,9 +617,22 @@ export default function App() {
               persona={activePersona}
               contextSize={contextSize}
               thinkingMode={thinkingMode}
+              numThread={numThread}
+              inferenceBackend={inferenceBackend}
               cavemanMode={cavemanMode}
               sidebarOpen={sidebarOpen}
               rightPanelOpen={rightPanelOpen}
+              hasNovelOutline={novelOutlineReady}
+              onStartChapter={() => {
+                if (!novelFirstChapter) return;
+                sendMessage(
+                  `[NOVEL_DRAFT:${activeSessionId}:${novelFirstChapter.number}]`,
+                  model,
+                  activeSessionId,
+                  'novelist',
+                  { isolated: true, numCtx: contextSize, think: thinkingMode, numThread, inferenceBackend, caveman: false }
+                );
+              }}
               onToggleSidebar={() => setSidebarOpen((o) => !o)}
               onToggleRightPanel={() => setRightPanelOpen((o) => !o)}
             />
@@ -532,10 +669,9 @@ export default function App() {
             </button>
 
             {/* Panel content */}
-            {rightPanelOpen && (
-              <div style={{
-                width: '50vw',
-                minWidth: 400,
+            <div style={{
+                width: rightPanelOpen ? '50vw' : 0,
+                minWidth: rightPanelOpen ? 400 : 0,
                 display: 'flex',
                 flexDirection: 'column',
                 overflow: 'hidden',
@@ -552,6 +688,7 @@ export default function App() {
                     { id: 'editor', label: '📝 Editor' },
                     { id: 'terminal', label: '⌨ Terminal' },
                     { id: 'files', label: '📁 Files' },
+                    { id: 'novel', label: '📖 Novel' },
                   ] as const).map((tab) => (
                     <button
                       key={tab.id}
@@ -595,9 +732,37 @@ export default function App() {
                       onFolderOpenChange={handleFolderOpenChange}
                     />
                   )}
+                  <div style={{
+                    display: rightPanelTab === 'novel' ? 'flex' : 'none',
+                    flex: 1,
+                    minHeight: 0,
+                    flexDirection: 'column',
+                  }}>
+                    <NovelStudio
+                      sessionId={activeSessionId}
+                      modelId={model}
+                      thinkingMode={thinkingMode}
+                      contextSize={contextSize}
+                      isRunning={isRunning}
+                      stop={stop}
+                      killModel={killModel}
+                      inferenceBackend={inferenceBackend}
+                      onCreateNovelSession={createNovelChat}
+                      onActivateNovelSession={activateNovelChat}
+                      onOutlineReady={handleNovelOutlineReady}
+                      onDraftChapter={(novelId, chapterNum, chapterTitle) => {
+                        sendMessage(
+                          `[NOVEL_DRAFT:${novelId}:${chapterNum}]`,
+                          model,
+                          activeSessionId,
+                          'novelist',
+                          { isolated: true, numCtx: contextSize, think: thinkingMode, numThread, inferenceBackend, caveman: false }
+                        );
+                      }}
+                    />
+                  </div>
                 </div>
               </div>
-            )}
           </div>
         </div>
       </div>
