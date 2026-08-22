@@ -8,34 +8,70 @@ import { runTool, ToolName } from '../lib/toolRunner.js';
 import { TOOL_DEFINITIONS, WORKSPACE_DIR } from '../lib/tools.js';
 import * as novelStorage from '../lib/novel/storage.js';
 import { inferenceDispatcher } from '../lib/inferenceDispatcher.js';
+import {
+  ingestAttachments,
+  readImageAttachments,
+  sessionAttachmentsDir,
+  contentTypeForFile,
+  type IncomingAttachment,
+} from '../lib/attachments.js';
 
 const router = Router();
 const OLLAMA_URL = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
 const LLAMACPP_URL = process.env.LLAMACPP_URL ?? 'http://127.0.0.1:8080';
-// Keep the full working context by default. Deployments can override this
-// without code changes through OLLAMA_NUM_CTX.
-const OLLAMA_NUM_CTX = Number.parseInt(process.env.OLLAMA_NUM_CTX ?? '262144', 10);
-const LLAMACPP_NUM_CTX = Number.parseInt(process.env.LLAMACPP_NUM_CTX ?? '32768', 10);
+// No session-token cap by default. The env override OLLAMA_NUM_CTX lets
+// deployments tune this; Ollama itself enforces the model's own ceiling.
+const OLLAMA_NUM_CTX = Number.parseInt(process.env.OLLAMA_NUM_CTX ?? '1048576', 10);
+const LLAMACPP_NUM_CTX = Number.parseInt(process.env.LLAMACPP_NUM_CTX ?? '1048576', 10);
 // Isolated story packets are capped well below this. A smaller KV cache avoids
 // reserving a 262k-token window for every prose continuation.
 const STORY_NUM_CTX = Number.parseInt(process.env.STORY_NUM_CTX ?? '16384', 10);
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE ?? '15m';
-const parsedNumPredict = Number.parseInt(process.env.OLLAMA_NUM_PREDICT ?? '1536', 10);
-const OLLAMA_NUM_PREDICT = Number.isFinite(parsedNumPredict) && parsedNumPredict > 0 ? parsedNumPredict : 1536;
+// A single write_file call must fit the whole file (filepath + content) plus
+// any hidden reasoning tokens in one response. 1536 truncated mid-content on
+// files larger than ~1500 tokens, dropping the trailing filepath argument and
+// silently losing the file. 8192 comfortably covers typical single-file writes.
+const parsedNumPredict = Number.parseInt(process.env.OLLAMA_NUM_PREDICT ?? '8192', 10);
+const OLLAMA_NUM_PREDICT = Number.isFinite(parsedNumPredict) && parsedNumPredict > 0 ? parsedNumPredict : 8192;
+// Thinking tokens are billed against num_predict, so a think=true turn can burn
+// its whole budget inside <think> and be cut off (done_reason:'length') before
+// emitting any visible content or a tool call. Reasoning turns get this extra
+// ceiling on top of OLLAMA_NUM_PREDICT.
+const parsedThinkOverhead = Number.parseInt(process.env.OLLAMA_THINKING_NUM_PREDICT_OVERHEAD ?? '16384', 10);
+const THINKING_NUM_PREDICT_OVERHEAD = Number.isFinite(parsedThinkOverhead) && parsedThinkOverhead >= 0 ? parsedThinkOverhead : 16384;
+// ── Thinking budget control ─────────────────────────────────────────────────
+// Maximum tokens the model may spend inside <think> on the FIRST response turn.
+// Subsequent (follow-up) execution turns are capped at THINK_BUDGET_FOLLOWUP_RATIO (30%)
+// of this budget. A tool error restores the full initial budget for diagnostic reasoning.
+// Set to 0 to disable thinking budget enforcement entirely.
+const parsedThinkBudgetInitial = Number.parseInt(process.env.THINK_BUDGET_INITIAL ?? '1000', 10);
+const THINK_BUDGET_INITIAL = Number.isFinite(parsedThinkBudgetInitial) && parsedThinkBudgetInitial >= 0
+  ? parsedThinkBudgetInitial
+  : 1000;
+const parsedFollowupRatio = Number.parseFloat(process.env.THINK_BUDGET_FOLLOWUP_RATIO ?? '0.30');
+const THINK_BUDGET_FOLLOWUP_RATIO = Number.isFinite(parsedFollowupRatio)
+  ? Math.min(Math.max(parsedFollowupRatio, 0.05), 1.0)
+  : 0.30;
+const parsedTokensToChars = Number.parseFloat(process.env.THINK_TOKENS_TO_CHARS ?? '3.5');
+const THINK_TOKENS_TO_CHARS = Number.isFinite(parsedTokensToChars) && parsedTokensToChars > 0
+  ? parsedTokensToChars
+  : 3.5;
 const parsedNovelDraftNumPredict = Number.parseInt(process.env.NOVEL_DRAFT_NUM_PREDICT ?? '8192', 10);
 const NOVEL_DRAFT_NUM_PREDICT = Number.isFinite(parsedNovelDraftNumPredict) && parsedNovelDraftNumPredict > 0
   ? parsedNovelDraftNumPredict
   : 8192;
 const NOVEL_DRAFT_MAX_CONTINUATIONS = 3;
-const parsedToolContextCharLimit = Number.parseInt(process.env.TOOL_CONTEXT_CHAR_LIMIT ?? '8000', 10);
-const TOOL_CONTEXT_CHAR_LIMIT = Number.isFinite(parsedToolContextCharLimit) && parsedToolContextCharLimit > 0 ? parsedToolContextCharLimit : 8000;
+// No char limit on tool output fed back into context. Truncating silently
+// dropped chunks of large file reads / build logs and broke long builds.
+// Set TOOL_CONTEXT_CHAR_LIMIT only if you have a specific reason.
+const parsedToolContextCharLimit = Number.parseInt(process.env.TOOL_CONTEXT_CHAR_LIMIT ?? '0', 10);
+const TOOL_CONTEXT_CHAR_LIMIT = Number.isFinite(parsedToolContextCharLimit) && parsedToolContextCharLimit > 0 ? parsedToolContextCharLimit : Infinity;
 const CONTEXT_SIZES = new Set([16_384, 32_768, 65_536, 131_072, 262_144]);
-// A 4–7 source report normally needs a few searches and a handful of source
-// reads. Keeping this small prevents CPU-only models from spending an hour
-// reprocessing a growing tool transcript.
-const MAX_TOOL_CALLS_PER_RUN = 10;
-const MAX_TOOL_FAILURES_PER_RUN = 4;
-const MAX_SEARCH_FAILURES_PER_RUN = 2;
+// Tool calls are unlimited — the agent may iterate as long as it keeps making
+// progress. The guardrail is CONSECUTIVE failures: 3 in a row pauses for human
+// guidance (ask_user), 5 in a row kills the run for human review. Any success
+// resets the consecutive-failure counter.
+const MAX_CONSECUTIVE_FAILURES = 5;
 const SESSIONS_DIR = path.resolve(WORKSPACE_DIR, '.sessions');
 const OLLAMA_FAILURE_LOG_PATH = path.resolve(WORKSPACE_DIR, '.logs', 'ollama-failures.jsonl');
 const MAX_OLLAMA_FAILURE_LOG_BYTES = 512 * 1024;
@@ -62,6 +98,7 @@ let ollamaFailureLogQueue = Promise.resolve();
 interface ModelCapabilities {
   supportsTools: boolean;
   supportsThinking: boolean;
+  supportsVision: boolean;
   contextLength?: number;
   systemPromptType?: string;
 }
@@ -709,19 +746,29 @@ async function ensureLlamaCppServerReady(selectedModel?: string, requestedContex
 await fs.mkdir(SESSIONS_DIR, { recursive: true });
 
 // Per-session context managers in-memory cache
-const sessions = new Map<string, ContextManager>();
+export const sessions = new Map<string, ContextManager>();
 
-interface ActiveRun {
+export interface AskUserRequest {
+  kind: 'install' | 'guidance';
+  prompt: string;
+  command?: string;
+  options?: string[];
+}
+
+export interface ActiveRun {
   model: string;
-  status: 'thinking' | 'tool';
+  status: 'thinking' | 'tool' | 'paused';
   statusText: string;
   partialContent: string;
   hasStartedGenerating: boolean;
   startedAt: number;
   updatedAt: number;
+  provider?: string;
+  /** Present while the run is paused waiting for the user to approve/guide. */
+  pausedAskUser?: AskUserRequest;
 }
 
-const activeRuns = new Map<string, ActiveRun>();
+export const activeRuns = new Map<string, ActiveRun>();
 
 interface ExtractedEvidence {
   url: string;
@@ -924,48 +971,127 @@ function truncateToolOutputForContext(content: string): string {
 
 /**
  * Some reasoning models emit their chain of thought in `content` rather than
- * Ollama's separate `thinking` field. Remove those tags from answer content
- * while forwarding their inner text through the thinking callback.
+ * Ollama's separate `thinking` field, often without an explicit opening <think> tag.
+ * Remove those tags and thinking text from answer content while forwarding their
+ * inner text through the thinking callback.
  */
-function createVisibleContentFilter(onThinking?: (content: string) => void) {
-  let insideThink = false;
+function createVisibleContentFilter(
+  onThinking?: (content: string) => void,
+  startInsideThink = false,
+) {
+  let insideThink = startInsideThink;
+  let nativeThinkingSeen = false;
   let pending = '';
-  const openTag = '<think>';
-  const closeTag = '</think>';
+  const OPEN_TAGS = ['<think>', '<thought>'];
+  const CLOSE_TAGS = ['</think>', '</thought>'];
 
   const filter = (chunk: string): string => {
+    if (nativeThinkingSeen) {
+      let cleaned = pending + chunk;
+      pending = '';
+      for (const tag of [...OPEN_TAGS, ...CLOSE_TAGS]) {
+        cleaned = cleaned.replaceAll(new RegExp(tag, 'gi'), '');
+      }
+      return cleaned;
+    }
+
     let input = pending + chunk;
     pending = '';
     let visible = '';
 
     while (input) {
       const lower = input.toLowerCase();
+
       if (insideThink) {
-        const closeAt = lower.indexOf(closeTag);
-        if (closeAt < 0) {
-          const safeLength = Math.max(0, input.length - (closeTag.length - 1));
+        let earliestCloseIdx = -1;
+        let matchedCloseTag = '';
+        for (const tag of CLOSE_TAGS) {
+          const idx = lower.indexOf(tag);
+          if (idx >= 0 && (earliestCloseIdx === -1 || idx < earliestCloseIdx)) {
+            earliestCloseIdx = idx;
+            matchedCloseTag = tag;
+          }
+        }
+
+        let earliestOpenIdx = -1;
+        let matchedOpenTag = '';
+        for (const tag of OPEN_TAGS) {
+          const idx = lower.indexOf(tag);
+          if (idx >= 0 && (earliestOpenIdx === -1 || idx < earliestOpenIdx)) {
+            earliestOpenIdx = idx;
+            matchedOpenTag = tag;
+          }
+        }
+
+        if (earliestOpenIdx >= 0 && (earliestCloseIdx === -1 || earliestOpenIdx < earliestCloseIdx)) {
+          if (earliestOpenIdx > 0) {
+            onThinking?.(input.slice(0, earliestOpenIdx));
+          }
+          input = input.slice(earliestOpenIdx + matchedOpenTag.length);
+          continue;
+        }
+
+        if (earliestCloseIdx < 0) {
+          const maxTagLen = 10;
+          const safeLength = Math.max(0, input.length - (maxTagLen - 1));
           if (safeLength > 0) onThinking?.(input.slice(0, safeLength));
           pending = input.slice(safeLength);
           return visible;
         }
-        if (closeAt > 0) onThinking?.(input.slice(0, closeAt));
-        input = input.slice(closeAt + closeTag.length);
+
+        if (earliestCloseIdx > 0) onThinking?.(input.slice(0, earliestCloseIdx));
+        input = input.slice(earliestCloseIdx + matchedCloseTag.length);
         insideThink = false;
         continue;
       }
 
-      const openAt = lower.indexOf(openTag);
-      if (openAt < 0) {
-        const safeLength = Math.max(0, input.length - (openTag.length - 1));
+      let earliestOpenIdx = -1;
+      let matchedOpenTag = '';
+      for (const tag of OPEN_TAGS) {
+        const idx = lower.indexOf(tag);
+        if (idx >= 0 && (earliestOpenIdx === -1 || idx < earliestOpenIdx)) {
+          earliestOpenIdx = idx;
+          matchedOpenTag = tag;
+        }
+      }
+
+      let earliestCloseIdx = -1;
+      let matchedCloseTag = '';
+      for (const tag of CLOSE_TAGS) {
+        const idx = lower.indexOf(tag);
+        if (idx >= 0 && (earliestCloseIdx === -1 || idx < earliestCloseIdx)) {
+          earliestCloseIdx = idx;
+          matchedCloseTag = tag;
+        }
+      }
+
+      if (earliestCloseIdx >= 0 && (earliestOpenIdx === -1 || earliestCloseIdx < earliestOpenIdx)) {
+        if (earliestCloseIdx > 0) {
+          onThinking?.(input.slice(0, earliestCloseIdx));
+        }
+        input = input.slice(earliestCloseIdx + matchedCloseTag.length);
+        insideThink = false;
+        continue;
+      }
+
+      if (earliestOpenIdx < 0) {
+        const maxTagLen = 10;
+        const safeLength = Math.max(0, input.length - (maxTagLen - 1));
         visible += input.slice(0, safeLength);
         pending = input.slice(safeLength);
         return visible;
       }
-      visible += input.slice(0, openAt);
-      input = input.slice(openAt + openTag.length);
+
+      visible += input.slice(0, earliestOpenIdx);
+      input = input.slice(earliestOpenIdx + matchedOpenTag.length);
       insideThink = true;
     }
     return visible;
+  };
+
+  filter.markNativeThinkingSeen = () => {
+    nativeThinkingSeen = true;
+    insideThink = false;
   };
 
   filter.flush = (): string => {
@@ -985,6 +1111,7 @@ const FALLBACK_TOOL_NAMES = new Set<ToolName>([
   'web_search',
   'browse_url',
   'write_file',
+  'edit_file',
   'read_file',
   'run_terminal',
 ]);
@@ -1057,7 +1184,7 @@ function sanitizeNoToolsAssistantContent(content: string): string {
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/<\/?think>/gi, '');
   const withoutMarkup = removeFallbackToolCallMarkup(withoutThink);
-  const toolCallLine = /^\s*(web_search|browse_url|write_file|read_file|run_terminal)\s*\(.+\)\s*$/i;
+  const toolCallLine = /^\s*(web_search|browse_url|write_file|edit_file|read_file|run_terminal)\s*\(.+\)\s*$/i;
   const filteredLines = withoutMarkup
     .split('\n')
     .filter((line) => !toolCallLine.test(line.trim()));
@@ -1116,6 +1243,7 @@ async function getModelCapabilities(model: string, signal: AbortSignal, backend:
   const mapDef = modelMap?.models?.find((m: any) => m.id === model);
   const mapSupportsTools = mapDef?.capabilities?.function_calling === true;
   const mapSupportsThinking = mapDef?.capabilities?.thinking_mode === true;
+  const mapSupportsVision = mapDef?.capabilities?.vision === true;
   const mapContextLength: number | undefined = mapDef?.max_context;
   const mapSystemPromptType: string | undefined = mapDef?.system_prompt_type;
 
@@ -1123,6 +1251,7 @@ async function getModelCapabilities(model: string, signal: AbortSignal, backend:
     const capabilities = {
       supportsTools: false,
       supportsThinking: false,
+      supportsVision: false,
       contextLength: mapContextLength ?? (Number.isFinite(LLAMACPP_NUM_CTX) && LLAMACPP_NUM_CTX > 0 ? LLAMACPP_NUM_CTX : 32_768),
       systemPromptType: mapSystemPromptType,
     };
@@ -1141,6 +1270,7 @@ async function getModelCapabilities(model: string, signal: AbortSignal, backend:
       const capabilities = {
         supportsTools: mapSupportsTools,
         supportsThinking: mapSupportsThinking,
+        supportsVision: mapSupportsVision,
         contextLength: mapContextLength,
         systemPromptType: mapSystemPromptType,
       };
@@ -1155,6 +1285,7 @@ async function getModelCapabilities(model: string, signal: AbortSignal, backend:
       // OR Ollama's report with model_map so either source can enable tools
       supportsTools: (data.capabilities?.includes('tools') ?? false) || mapSupportsTools,
       supportsThinking: (data.capabilities?.includes('thinking') ?? false) || mapSupportsThinking,
+      supportsVision: (data.capabilities?.includes('vision') ?? false) || mapSupportsVision,
       // Prefer Ollama's value; fall back to model_map max_context
       contextLength: data.model_info?.['llama.context_length'] ?? mapContextLength,
       systemPromptType: mapSystemPromptType,
@@ -1166,6 +1297,7 @@ async function getModelCapabilities(model: string, signal: AbortSignal, backend:
     const capabilities = {
       supportsTools: mapSupportsTools,
       supportsThinking: mapSupportsThinking,
+      supportsVision: mapSupportsVision,
       contextLength: mapContextLength,
       systemPromptType: mapSystemPromptType,
     };
@@ -1194,23 +1326,36 @@ function normalizeOllamaMessages(messages: Message[], systemPromptType?: string)
     return { ...message, tool_calls: toolCalls as unknown as Message['tool_calls'] };
   });
 
-  if (systemPromptType?.toLowerCase() !== 'mistral') return outboundMessages;
+  // Mistral: embed all system content into the first user message (no system role).
+  if (systemPromptType?.toLowerCase() === 'mistral') {
+    const systemContent = outboundMessages
+      .filter((message) => message.role === 'system')
+      .map((message) => message.content)
+      .join('\n\n');
+    if (!systemContent) return outboundMessages;
 
-  const systemContent = outboundMessages
-    .filter((message) => message.role === 'system')
-    .map((message) => message.content)
-    .join('\n\n');
-  if (!systemContent) return outboundMessages;
+    const nonSystemMessages = outboundMessages.filter((message) => message.role !== 'system');
+    const firstUserIndex = nonSystemMessages.findIndex((message) => message.role === 'user');
+    if (firstUserIndex < 0) {
+      return [{ role: 'user', content: systemContent }, ...nonSystemMessages];
+    }
 
-  const nonSystemMessages = outboundMessages.filter((message) => message.role !== 'system');
-  const firstUserIndex = nonSystemMessages.findIndex((message) => message.role === 'user');
-  if (firstUserIndex < 0) {
-    return [{ role: 'user', content: systemContent }, ...nonSystemMessages];
+    return nonSystemMessages.map((message, index) => index === firstUserIndex
+        ? { ...message, content: `${systemContent}\n\n${message.content}` }
+        : message);
   }
 
-  return nonSystemMessages.map((message, index) => index === firstUserIndex
-      ? { ...message, content: `${systemContent}\n\n${message.content}` }
-      : message);
+  // General: hoist all system messages to the front as a single merged block.
+  // Required for models (e.g. Qwen) whose Jinja template enforces system-first.
+  // Preserves order of non-system messages; no-ops when already in correct order.
+  const systemMessages = outboundMessages.filter((m) => m.role === 'system');
+  if (systemMessages.length <= 1 && (systemMessages.length === 0 || outboundMessages[0].role === 'system')) {
+    return outboundMessages;
+  }
+
+  const mergedSystemContent = systemMessages.map((m) => m.content).join('\n\n');
+  const nonSystem = outboundMessages.filter((m) => m.role !== 'system');
+  return [{ role: 'system' as const, content: mergedSystemContent }, ...nonSystem];
 }
 
 // Default persona fallbacks in case file read fails
@@ -1222,7 +1367,7 @@ const FALLBACK_PERSONAS: Record<string, string> = {
 };
 
 // Dynamic markdown parser for personas.md
-async function getPersonaPrompt(personaKey: string): Promise<string> {
+export async function getPersonaPrompt(personaKey: string): Promise<string> {
   try {
     const filePath = path.resolve(WORKSPACE_DIR, '../personas.md');
     const content = await fs.readFile(filePath, 'utf-8');
@@ -1249,7 +1394,7 @@ async function getPersonaPrompt(personaKey: string): Promise<string> {
     } else if (personaKey === 'system') {
       rule = '\n\nTool-use guidance: You have access to web_search, browse_url, and read_file tools. Use them proactively to research unknown topics, verify uncertain claims, and recommend models based on current knowledge. For model recommendations, consider task complexity, speed requirements, and available VRAM. Admit when you don\'t know rather than guessing.';
     } else {
-      rule = '\n\nTool-use mandate: You MUST use the provided tools (write_file, run_terminal, read_file) to perform all file and command operations. NEVER describe, narrate, or simulate writing a file or running a command in plain text - always emit the actual tool call. If you support reasoning/thinking, place internal planning inside <think>...</think> tags; your visible response must contain only tool calls and brief status lines.';
+      rule = '\n\nTool-use mandate: You MUST use the provided tools (write_file, edit_file, run_terminal, read_file) to perform all file and directory operations. NEVER run package installation or initialization commands (npm install, npm init, npx tailwindcss init, pip install, etc.) in the terminal—write all configuration files (package.json, tailwind.config.js, vite.config.js, etc.) and code files directly using write_file. Provide install and run instructions for the user at the end in your final response. To FIX or CHANGE part of an existing file, use edit_file (replace a unique old_str with new_str) instead of rewriting the whole file with write_file. In each write_file call put "filepath" before "content". If you support reasoning/thinking, keep internal planning inside <think>...</think> strictly concise and bounded. Never draft whole file contents inside thoughts or meander; close </think> promptly and emit the tool call.';
     }
     return `${persona}${rule}`;
   } catch (err) {
@@ -1260,13 +1405,13 @@ async function getPersonaPrompt(personaKey: string): Promise<string> {
     } else if (personaKey === 'system') {
       rule = '\n\nTool-use guidance: You have access to web_search, browse_url, and read_file tools. Use them proactively to research unknown topics, verify uncertain claims, and recommend models based on current knowledge. For model recommendations, consider task complexity, speed requirements, and available VRAM. Admit when you don\'t know rather than guessing.';
     } else {
-      rule = '\n\nTool-use mandate: You MUST use the provided tools (write_file, run_terminal, read_file) to perform all file and command operations. NEVER describe, narrate, or simulate writing a file or running a command in plain text - always emit the actual tool call. If you support reasoning/thinking, place internal planning inside <think>...</think> tags; your visible response must contain only tool calls and brief status lines.';
+      rule = '\n\nTool-use mandate: You MUST use the provided tools (write_file, edit_file, run_terminal, read_file) to perform all file and directory operations. NEVER run package installation or initialization commands (npm install, npm init, npx tailwindcss init, pip install, etc.) in the terminal—write all configuration files (package.json, tailwind.config.js, vite.config.js, etc.) and code files directly using write_file. Provide install and run instructions for the user at the end in your final response. To FIX or CHANGE part of an existing file, use edit_file (replace a unique old_str with new_str) instead of rewriting the whole file with write_file. In each write_file call put "filepath" before "content". If you support reasoning/thinking, keep internal planning inside <think>...</think> strictly concise and bounded. Never draft whole file contents inside thoughts or meander; close </think> promptly and emit the tool call.';
     }
     return `${persona}${rule}`;
   }
 }
 
-async function getCtx(sessionId: string, fallbackPersona: string = 'coder'): Promise<{ ctx: ContextManager; persona: string; model: string }> {
+export async function getCtx(sessionId: string, fallbackPersona: string = 'coder'): Promise<{ ctx: ContextManager; persona: string; model: string }> {
   if (sessions.has(sessionId)) {
     let currentPersona = fallbackPersona;
     let currentModel = '';
@@ -1322,7 +1467,14 @@ async function getCtx(sessionId: string, fallbackPersona: string = 'coder'): Pro
   return { ctx, persona: loadedPersona, model: loadedModel };
 }
 
-async function saveSessionToFile(sessionId: string, ctx: ContextManager, persona: string, model: string, title?: string) {
+export async function saveSessionToFile(
+  sessionId: string,
+  ctx: ContextManager,
+  persona: string,
+  model: string,
+  title?: string,
+  provider?: string,
+) {
   const filePath = path.join(SESSIONS_DIR, `${sessionId}.json`);
   const messages = ctx.getMessages();
   
@@ -1337,6 +1489,7 @@ async function saveSessionToFile(sessionId: string, ctx: ContextManager, persona
     title: sessionTitle,
     persona,
     model,
+    ...(provider ? { provider } : {}),
     updatedAt: Date.now(),
     messages,
     run: activeRuns.get(sessionId),
@@ -1355,7 +1508,7 @@ function normalizeUrl(value: string): string {
 }
 
 /** Reject model-invented URLs before a browser request is made. */
-function isBrowseUrlAllowed(url: string, messages: Message[]): boolean {
+export function isBrowseUrlAllowed(url: string, messages: Message[]): boolean {
   const normalized = normalizeUrl(url);
   if (!normalized) return false;
 
@@ -1367,6 +1520,58 @@ function isBrowseUrlAllowed(url: string, messages: Message[]): boolean {
   });
 }
 
+// GET /api/ollama/loaded — returns currently loaded model(s) resident in memory
+router.get('/loaded', async (req: Request, res: Response) => {
+  const backend = resolveInferenceBackend(req.query.backend);
+  try {
+    if (backend === 'llamacpp') {
+      const runtimeLoadedModel = await getLlamaCppLoadedModelId();
+      const runtimeInfo = await getLlamaCppRuntimeInfo();
+      if (runtimeInfo.status === 200 && runtimeLoadedModel) {
+        const runtimeFriendly = await resolveFriendlyLlamaModel(runtimeLoadedModel);
+        res.json({
+          backend: 'llamacpp',
+          loaded: true,
+          models: [
+            {
+              name: runtimeFriendly.mapId || runtimeLoadedModel,
+              displayName: runtimeFriendly.displayName,
+              model: runtimeLoadedModel,
+              nCtx: runtimeInfo.nCtx,
+            },
+          ],
+        });
+        return;
+      }
+      res.json({ backend: 'llamacpp', loaded: false, models: [] });
+      return;
+    }
+
+    const resp = await fetch(`${OLLAMA_URL}/api/ps`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!resp.ok) {
+      res.json({ backend: 'ollama', loaded: false, models: [] });
+      return;
+    }
+    const data = (await resp.json()) as any;
+    const loadedList = Array.isArray(data?.models) ? data.models : [];
+    res.json({
+      backend: 'ollama',
+      loaded: loadedList.length > 0,
+      models: loadedList.map((m: any) => ({
+        name: m.name || m.model,
+        model: m.model,
+        size: m.size,
+        sizeVram: m.size_vram,
+        expiresAt: m.expires_at,
+      })),
+    });
+  } catch (err: any) {
+    res.json({ backend, loaded: false, models: [], error: err.message });
+  }
+});
+
 // GET /api/ollama/models
 router.get('/models', async (req: Request, res: Response) => {
   const backend = resolveInferenceBackend(req.query.backend);
@@ -1377,7 +1582,7 @@ router.get('/models', async (req: Request, res: Response) => {
       const runtimeFriendly = runtimeLoadedModel ? await resolveFriendlyLlamaModel(runtimeLoadedModel) : null;
       const localModels = await listLocalOllamaManifestModels();
       const models = await Promise.all(localModels.map(async (model) => {
-        const isLoaded = runtimeFriendly?.mapId === model.name;
+        const isLoaded = Boolean(runtimeFriendly?.mapId && runtimeFriendly.mapId === model.name);
         const blobPath = await resolveBlobPathFromModelTag(model.name);
         const unsupportedArchitecture = blobPath ? getUnsupportedArchitectureForModelPath(blobPath) : undefined;
         const syclAvailable = blobPath !== null && !unsupportedArchitecture;
@@ -1389,6 +1594,7 @@ router.get('/models', async (req: Request, res: Response) => {
             ? `unsupported architecture: ${unsupportedArchitecture}`
             : (blobPath ? undefined : 'no local GGUF blob found'),
           display_name: isLoaded ? `${model.name} (loaded SYCL)` : `${model.name} (SYCL)`,
+          is_loaded: isLoaded,
         };
       }));
 
@@ -1404,6 +1610,7 @@ router.get('/models', async (req: Request, res: Response) => {
           sycl_available: !loadedArchUnsupported,
           sycl_reason: loadedArchUnsupported ? `unsupported architecture: ${loadedArchUnsupported}` : undefined,
           display_name: `${runtimeFriendly?.displayName ?? runtimeLoadedModel} (loaded SYCL)`,
+          is_loaded: true,
         });
       }
 
@@ -1411,13 +1618,37 @@ router.get('/models', async (req: Request, res: Response) => {
       return;
     }
 
-    const resp = await fetch(`${OLLAMA_URL}/api/tags`);
-    if (!resp.ok) {
-      const detail = await resp.text();
-      res.status(resp.status).json({ error: detail || resp.statusText });
+    const [tagsResp, psResp] = await Promise.allSettled([
+      fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(5000) }),
+      fetch(`${OLLAMA_URL}/api/ps`, { signal: AbortSignal.timeout(3000) }),
+    ]);
+
+    if (tagsResp.status !== 'fulfilled' || !tagsResp.value.ok) {
+      const detail = tagsResp.status === 'fulfilled' ? await tagsResp.value.text() : tagsResp.reason?.message;
+      res.status(502).json({ error: detail || 'Ollama unreachable' });
       return;
     }
-    res.json(await resp.json());
+
+    const tagsData = (await tagsResp.value.json()) as any;
+    let loadedModelNames: string[] = [];
+    if (psResp.status === 'fulfilled' && psResp.value.ok) {
+      try {
+        const psData = (await psResp.value.json()) as any;
+        if (Array.isArray(psData?.models)) {
+          loadedModelNames = psData.models.map((m: any) => m.name || m.model);
+        }
+      } catch {}
+    }
+
+    const models = (tagsData?.models || []).map((m: any) => {
+      const isLoaded = loadedModelNames.some((loadedName) => loadedName === m.name || loadedName.startsWith(`${m.name}:`));
+      return {
+        ...m,
+        is_loaded: isLoaded,
+      };
+    });
+
+    res.json({ models });
   } catch (err: any) {
     console.error(`❌ Failed to connect to backend at ${backendUrl}:`, err.message);
     res.status(502).json({ error: err.message });
@@ -1477,10 +1708,11 @@ router.get('/sessions', async (_req: Request, res: Response) => {
     const list = [];
 
     for (const file of files) {
-      if (!file.endsWith('.json')) continue;
+      if (!file.endsWith('.json') || file.endsWith('-ledger.json')) continue;
       try {
         const content = await fs.readFile(path.join(SESSIONS_DIR, file), 'utf-8');
         const parsed = JSON.parse(content);
+        if (typeof parsed.sessionId !== 'string' || !parsed.sessionId.trim()) continue;
         list.push({
           sessionId: parsed.sessionId,
           title: parsed.title || 'Untitled Chat',
@@ -1542,7 +1774,60 @@ router.delete('/session', async (req: Request, res: Response) => {
 });
 
 // POST /api/ollama/stop
-const abortControllers = new Map<string, AbortController>();
+export const abortControllers = new Map<string, AbortController>();
+
+// ── Human-in-the-loop pause (ask_user) ─────────────────────────────────────
+// When the agent hits a wall — a side-effecting install it wants to run, or a
+// tool-failure budget near exhaustion — the run pauses and surfaces an
+// approval/guidance prompt to the user. The in-flight chat request awaits the
+// matching resumeDeferred; the separate /resume route resolves it.
+//
+// Motivation: a weak model (e.g. gemma4-uncensored) was observed retrying an
+// identical failing command (`npx tailwindcss init -p`, which Tailwind v4
+// removed) four times until the failure budget forced a final report, then
+// kept emitting tool calls after tools were disabled. Pausing for the human
+// before the budget is burned lets the user approve the correct install
+// (e.g. `npm install -D @tailwindcss/vite`) or steer the agent off the loop.
+// 'timeout' kept as a type variant for backward compatibility but is no longer emitted —
+// pauses wait indefinitely until the user responds or aborts the run.
+export interface ResumeDecision {
+  decision: 'approve' | 'deny' | 'guidance' | 'timeout' | 'approve_all';
+  message?: string;
+  command?: string;
+}
+export const resumeDeferred = new Map<string, { resolve: (d: ResumeDecision) => void; reject: (e: Error) => void }>();
+
+// Commands that mutate the user's environment (install packages/tools). These
+// pause for explicit approval before the agent is allowed to run them. Once a
+// command is approved, its normalized form is allowlisted for the rest of the
+// run so the agent's re-issue is not re-intercepted.
+const SIDE_EFFECTING_INSTALL_RE = /(^|&&|;|\|\|)\s*(npm\s+(?:install|i|ci|install-ci|add)|pnpm\s+(?:add|install|i)|yarn\s+(?:add|install)|pip3?\s+install|python\s+-m\s+pip\s+install|pipx\s+install|uv\s+(?:pip\s+)?install|winget\s+install|choco\s+install|scoop\s+install|cargo\s+add|go\s+get|gem\s+install|apt(?:-get)?\s+install|brew\s+install|dotnet\s+(?:add|tool\s+install)|rustup\s+(?:component\s+)?add)\b/i;
+function isSideEffectingInstall(command: string): boolean {
+  return SIDE_EFFECTING_INSTALL_RE.test(command);
+}
+function normalizeCommand(command: string): string {
+  return command.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+router.post('/resume', (req: Request, res: Response) => {
+  const sessionId: string | undefined = req.body?.sessionId;
+  const deferred = sessionId ? resumeDeferred.get(sessionId) : undefined;
+  if (!deferred) {
+    res.status(404).json({ error: 'No pending approval for this session.' });
+    return;
+  }
+  const decision: ResumeDecision = {
+    decision: req.body?.decision === 'approve' ? 'approve'
+      : req.body?.decision === 'approve_all' ? 'approve_all'
+      : req.body?.decision === 'deny' ? 'deny'
+      : req.body?.decision === 'guidance' ? 'guidance'
+      : 'guidance',
+    ...(typeof req.body?.message === 'string' && req.body.message.trim() ? { message: req.body.message.trim() } : {}),
+    ...(typeof req.body?.command === 'string' && req.body.command.trim() ? { command: req.body.command.trim() } : {}),
+  };
+  deferred.resolve(decision);
+  res.json({ ok: true });
+});
 router.post('/stop', (req: Request, res: Response) => {
   const { sessionId } = req.body as { sessionId: string };
   abortControllers.get(sessionId)?.abort();
@@ -1600,6 +1885,32 @@ router.post('/reset', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+// POST /api/ollama/truncate — drop every message at/after fromTimestamp so a
+// prompt can be rerun from that point. System prompt (no created_at) survives.
+router.post('/truncate', async (req: Request, res: Response) => {
+  const { sessionId, fromTimestamp } = req.body as { sessionId: string; fromTimestamp: number };
+  if (!sessionId || typeof fromTimestamp !== 'number') {
+    res.status(400).json({ error: 'sessionId and fromTimestamp are required' });
+    return;
+  }
+  try {
+    abortControllers.get(sessionId)?.abort();
+    activeRuns.delete(sessionId);
+    sessions.delete(sessionId);
+
+    const filePath = path.join(SESSIONS_DIR, `${sessionId}.json`);
+    const data = JSON.parse(await fs.readFile(filePath, 'utf-8'));
+    const kept = (data.messages as any[]).filter((m) => (m.created_at ?? 0) < fromTimestamp);
+    data.messages = kept;
+    data.updatedAt = Date.now();
+    delete data.run;
+    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
+    res.json({ ok: true, remaining: kept.length });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/ollama/tokens
 router.get('/tokens', async (req: Request, res: Response) => {
   const sessionId = req.query.sessionId as string;
@@ -1607,9 +1918,30 @@ router.get('/tokens', async (req: Request, res: Response) => {
   res.json(ctx.getTokenUsage());
 });
 
+// GET /api/ollama/attachment?sessionId=..&file=..
+// Serves a stored attachment for display on session reload. Used by both the
+// local and cloud UIs since sessions share one attachments layout on disk.
+router.get('/attachment', async (req: Request, res: Response) => {
+  const sessionId = String(req.query.sessionId ?? '');
+  const file = path.basename(String(req.query.file ?? ''));
+  if (!sessionId || !file || file === '.' || file === '..') {
+    res.status(400).json({ error: 'sessionId and file are required.' });
+    return;
+  }
+  try {
+    const target = path.join(sessionAttachmentsDir(SESSIONS_DIR, sessionId), file);
+    const buf = await fs.readFile(target);
+    res.setHeader('Content-Type', contentTypeForFile(file));
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    res.send(buf);
+  } catch {
+    res.status(404).json({ error: 'Attachment not found.' });
+  }
+});
+
 // POST /api/ollama/chat
 router.post('/chat', async (req: Request, res: Response) => {
-  const { sessionId, model, message, pendingBrowse, persona, isolated, numCtx, think, numThread, caveman, inferenceBackend } = req.body as {
+  const { sessionId, model, message, pendingBrowse, persona, isolated, numCtx, think, numThread, caveman, inferenceBackend, attachments, autopilotInstalls: autopilotInstallsBody } = req.body as {
     sessionId: string;
     model: string;
     message?: string;
@@ -1621,7 +1953,15 @@ router.post('/chat', async (req: Request, res: Response) => {
     numThread?: number;
     caveman?: boolean;
     inferenceBackend?: InferenceBackend;
+    attachments?: IncomingAttachment[];
+    /** When true, side-effecting installs run without per-command approval
+     *  for the rest of the run (user opted in at session start, or flipped
+     *  on via the "Allow all installs" button during a paused install). */
+    autopilotInstalls?: boolean;
   };
+  // Mutable so the "Allow all installs" button in the install alert can flip
+  // it on at runtime, suppressing all future install prompts for this run.
+  let autopilotInstalls = Boolean(autopilotInstallsBody);
   const backend = resolveInferenceBackend(inferenceBackend);
   const backendUrl = getBackendUrl(backend);
   let llamaCppModelIdForRequest: string | null = null;
@@ -1634,8 +1974,12 @@ router.post('/chat', async (req: Request, res: Response) => {
   const selectedPersona = persona || 'coder';
   const requestedContext = numCtx ?? (isolated ? STORY_NUM_CTX : OLLAMA_NUM_CTX);
   const requestedNumThread = typeof numThread === 'number' ? Math.trunc(numThread) : undefined;
-  if (!CONTEXT_SIZES.has(requestedContext)) {
-    res.status(400).json({ error: 'Context must be one of 16k, 32k, 64k, 128k, or 262k.' });
+  // No hard session-token cap. Context size is whatever the client sends (or
+  // the OLLAMA_NUM_CTX default). Ollama enforces the model's own ceiling
+  // server-side; we don't second-guess it here so large multi-file builds
+  // (social media sites, monorepos) can ride the full available window.
+  if (requestedContext < 1024) {
+    res.status(400).json({ error: 'Context size too small (min 1024).' });
     return;
   }
   if (requestedNumThread !== undefined && (requestedNumThread < 1 || requestedNumThread > 64)) {
@@ -1854,13 +2198,29 @@ router.post('/chat', async (req: Request, res: Response) => {
       Math.ceil(novelDraftTargetWords * 1.5) + thinkingOverhead,
     );
     console.log(`[Novel draft] target=${novelDraftTargetWords} words, think=${Boolean(think)}, num_predict=${outputNumPredict}`);
+  } else if (think && backend === 'ollama') {
+    // Non-novel reasoning turn: grant the extra thinking ceiling so the model
+    // doesn't exhaust its budget inside <think> and get cut off before any
+    // visible content or tool call (mirrors the novel-draft overhead above).
+    outputNumPredict = OLLAMA_NUM_PREDICT + THINKING_NUM_PREDICT_OVERHEAD;
   }
+
+  // Persist any attachments to this session's folder and fold text files into
+  // the prompt. Image metadata rides along on the user message; the bytes stay
+  // on disk and are re-read when the model payload is built below.
+  const { metas: attachmentMetas, textBlocks: attachmentTextBlocks } =
+    await ingestAttachments(SESSIONS_DIR, sessionId, attachments);
 
   if (!userMessage) {
     if (pendingBrowse) {
       userMessage = { role: 'user', content: `[User approved browse: ${pendingBrowse}]`, created_at: Date.now() };
-    } else if (message) {
-      userMessage = { role: 'user', content: message, created_at: Date.now() };
+    } else if (message || attachmentMetas.length > 0) {
+      userMessage = {
+        role: 'user',
+        content: `${message ?? ''}${attachmentTextBlocks}`,
+        created_at: Date.now(),
+        ...(attachmentMetas.length > 0 ? { attachments: attachmentMetas } : {}),
+      };
     }
   }
   
@@ -1902,6 +2262,50 @@ router.post('/chat', async (req: Request, res: Response) => {
 
   const ac = new AbortController();
   abortControllers.set(sessionId, ac);
+
+  // ── ask_user pause primitives (closure-scoped to this run) ───────────────
+  // approvedCommands: normalized commands the user has already approved this
+  // run, so the agent's re-issue of an install isn't re-intercepted.
+  const approvedCommands = new Set<string>();
+  const NEAR_FAILURE_THRESHOLD = 3; // pause for guidance at 3 consecutive failures
+
+  // Pause the run and surface an approval/guidance prompt to the user. Resolves
+  // with the user's decision, or null if aborted, or {decision:'timeout'} after
+  // PAUSE_TIMEOUT_MS. Sends a 5s heartbeat so the SSE stream and the client
+  // stall detector don't time out while waiting.
+  const pauseForUser = async (request: AskUserRequest): Promise<ResumeDecision | null> => {
+    send('ask_user', { ...request, sessionId });
+    const run = activeRuns.get(sessionId);
+    if (run) {
+      run.status = 'paused';
+      run.statusText = 'Waiting for user approval…';
+      run.pausedAskUser = request;
+      run.updatedAt = Date.now();
+    }
+    await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+
+    return await new Promise<ResumeDecision | null>((resolve) => {
+      let settled = false;
+      let heartbeat: ReturnType<typeof setInterval> | undefined;
+      const finish = (decision: ResumeDecision | null) => {
+        if (settled) return;
+        settled = true;
+        if (heartbeat) clearInterval(heartbeat);
+        ac.signal.removeEventListener('abort', onAbort);
+        resumeDeferred.delete(sessionId);
+        const r = activeRuns.get(sessionId);
+        if (r) { r.pausedAskUser = undefined; r.updatedAt = Date.now(); }
+        resolve(decision);
+      };
+      const onAbort = () => finish(null);
+      heartbeat = setInterval(() => send('status', { message: 'Waiting for user approval…' }), 5_000);
+      ac.signal.addEventListener('abort', onAbort, { once: true });
+      resumeDeferred.set(sessionId, {
+        resolve: (d) => finish(d),
+        reject: () => finish(null),
+      });
+    });
+  };
   activeRuns.set(sessionId, {
     model,
     status: 'thinking',
@@ -1916,6 +2320,12 @@ router.post('/chat', async (req: Request, res: Response) => {
   let toolCallCount = 0;
   let toolFailureCount = 0;
   let searchFailureCount = 0;
+  // Consecutive failures (reset on any success). 3 → pause for guidance,
+  // 5 → kill the run for human review. Cumulative counts above are for logs.
+  let consecutiveFailures = 0;
+  const recentFailures: { name: string; detail: string }[] = [];
+  // Set when the run is killed (5 consecutive failures) to exit the loop.
+  let killed = false;
   let iterationNumber = 0;
   let novelDraftContinuationCount = 0;
   let novelDraftText = '';
@@ -1923,6 +2333,7 @@ router.post('/chat', async (req: Request, res: Response) => {
   let currentOllamaPhase: 'ollama_request' | 'ollama_stream' = 'ollama_request';
   let currentSystemPromptType: string | undefined;
   let currentAllowTools = false;
+  let lastToolWasError = false;
   let lastToolMetadata: { name: string; success: boolean; durationMs: number } | undefined;
   const recordOllamaFailure = async (
     phase: 'ollama_http' | 'ollama_stream' | 'ollama_request',
@@ -1984,6 +2395,10 @@ router.post('/chat', async (req: Request, res: Response) => {
     // results already in the conversation.
     let forceFinalResponse = false;
     let finalResponseRetryCount = 0;
+    // Tracks whether a terminal SSE event (done/stopped/error) was emitted.
+    // Some loop exits (e.g. forced-final-response retry exhaustion) leave the
+    // loop without a 'done', which would strand the client in a running state.
+    let terminalSent = false;
     while (iterating && !ac.signal.aborted) {
       iterationNumber += 1;
       pendingPartialContent = '';
@@ -2016,7 +2431,8 @@ router.post('/chat', async (req: Request, res: Response) => {
       const CAVEMAN_TOOL_DEFINITIONS = [
         { type: 'function', function: { name: 'web_search',   description: 'Brave Search; DuckDuckGo only if Brave reports exhausted credits. Returns results.', parameters: { type: 'object', properties: { query:    { type: 'string' } }, required: ['query'] } } },
         { type: 'function', function: { name: 'browse_url',   description: 'Fetch URL. Returns page text.',               parameters: { type: 'object', properties: { url:      { type: 'string' } }, required: ['url'] } } },
-        { type: 'function', function: { name: 'write_file',   description: 'Write file to agent-workspace.',              parameters: { type: 'object', properties: { filepath: { type: 'string' }, content: { type: 'string' } }, required: ['filepath', 'content'] } } },
+        { type: 'function', function: { name: 'write_file',   description: 'Write new file to agent-workspace.',           parameters: { type: 'object', properties: { filepath: { type: 'string' }, content: { type: 'string' } }, required: ['filepath', 'content'] } } },
+        { type: 'function', function: { name: 'edit_file',    description: 'Fix part of existing file. Replace one unique old_str with new_str. Use for edits, not full rewrite.', parameters: { type: 'object', properties: { filepath: { type: 'string' }, old_str: { type: 'string' }, new_str: { type: 'string' } }, required: ['filepath', 'old_str', 'new_str'] } } },
         { type: 'function', function: { name: 'read_file',    description: 'Read file from agent-workspace.',             parameters: { type: 'object', properties: { filepath: { type: 'string' } }, required: ['filepath'] } } },
         { type: 'function', function: { name: 'run_terminal', description: 'Run shell command in agent-workspace.',        parameters: { type: 'object', properties: { command:  { type: 'string' } }, required: ['command'] } } },
       ];
@@ -2031,6 +2447,35 @@ router.post('/chat', async (req: Request, res: Response) => {
         'Pattern between calls: [short status line] [next tool call OR final answer].',
       ].join('\n');
 
+      const isFirstTurn = iterationNumber === 1;
+      const isErrorTurn = lastToolWasError;
+      const thinkBudgetForTurn: number = (() => {
+        if (THINK_BUDGET_INITIAL === 0 || !think) return 0;
+        if (backend === 'ollama' && !capabilities.supportsThinking) return 0;
+        if (isFirstTurn || isErrorTurn) return THINK_BUDGET_INITIAL;
+        return Math.max(100, Math.round(THINK_BUDGET_INITIAL * THINK_BUDGET_FOLLOWUP_RATIO));
+      })();
+
+      if (thinkBudgetForTurn > 0 && !forceFinalResponse) {
+        let directiveContent = '';
+        if (isFirstTurn) {
+          directiveContent = `<think_budget>${thinkBudgetForTurn}</think_budget>\n` +
+            `[Reasoning Constraint - Initial Turn]\n` +
+            `You have a maximum budget of ${thinkBudgetForTurn} tokens for internal reasoning inside <think>...</think> for initial task decomposition and architecture planning.\n` +
+            `Do not meander or write whole files inside <think>. Keep planning concise. Once planned, immediately close </think> and emit your tool call.`;
+        } else if (isErrorTurn) {
+          directiveContent = `<think_budget>${thinkBudgetForTurn}</think_budget>\n` +
+            `[Reasoning Constraint - Error Recovery]\n` +
+            `A previous tool call encountered an error. A full budget of ${thinkBudgetForTurn} tokens is available in <think> to diagnose the failure and plan the targeted correction. Focus strictly on fixing the error. Once planned, close </think> and execute the fix.`;
+        } else {
+          directiveContent = `<think_budget>${thinkBudgetForTurn}</think_budget>\n` +
+            `[Reasoning Constraint - Execution / Follow-up Turn]\n` +
+            `You are in active execution mode. Your <think> budget is strictly limited to ${thinkBudgetForTurn} tokens (at most 30% of initial budget) for a single quick check.\n` +
+            `Do NOT replan the project or pre-generate entire files in <think>. Make one quick decision, close </think>, and proceed with the next tool call or response immediately.`;
+        }
+        modelMessages.push({ role: 'system' as const, content: directiveContent });
+      }
+
       if (caveman) {
         modelMessages.push({ role: 'system' as const, content: CAVEMAN_DIRECTIVE });
       }
@@ -2044,20 +2489,49 @@ router.post('/chat', async (req: Request, res: Response) => {
       const normalizedMessages = normalizeOllamaMessages(modelMessages, capabilities.systemPromptType);
       let assistantContent = '';
       let assistantThinking = '';
+      let thinkBudgetExceededThisTurn = false;
+      // Set when the model stops because it hit the output-token cap rather than
+      // finishing. A truncated response is what drops a large write_file's
+      // trailing filepath argument, so we react by giving the next turn room.
+      let responseTruncated = false;
       const pendingToolCalls: any[] = [];
 
       if (backend === 'ollama') {
         const activeToolDefs = caveman ? CAVEMAN_TOOL_DEFINITIONS : TOOL_DEFINITIONS;
+        // Re-read image attachments from disk and pass them as Ollama `images`
+        // (base64, no data-URI prefix). Done every turn so earlier images stay
+        // visible to a vision model across a multi-turn conversation.
+        const hasImageAttachments = normalizedMessages.some((message) =>
+          message.attachments?.some((attachment) => attachment.kind === 'image'),
+        );
+        if (hasImageAttachments && !capabilities.supportsVision) {
+          send('status', { message: 'Image attachments skipped because selected model lacks vision.' });
+        }
+        const messagesWithImages = await Promise.all(
+          normalizedMessages.map(async (m) => {
+            const wire: Record<string, unknown> = { ...m };
+            delete wire.attachments;
+            if (capabilities.supportsVision) {
+              const imgs = await readImageAttachments(SESSIONS_DIR, sessionId, m.attachments);
+              if (imgs.length > 0) wire.images = imgs.map((i) => i.base64);
+            }
+            return wire;
+          }),
+        );
+        let turnNumPredict = outputNumPredict;
+        if (think && !isNovelDraft) {
+          turnNumPredict = OLLAMA_NUM_PREDICT + (thinkBudgetForTurn > 0 ? thinkBudgetForTurn : THINKING_NUM_PREDICT_OVERHEAD);
+        }
         const body = {
           model,
-          messages: normalizedMessages,
+          messages: messagesWithImages,
           stream: true,
           // Supported by current Ollama releases; prevents models with optional
           // reasoning from spending their visible response on a hidden plan.
           think: Boolean(think),
           options: {
             num_ctx: activeContext,
-            num_predict: outputNumPredict,
+            num_predict: turnNumPredict,
             ...(requestedNumThread !== undefined ? { num_thread: requestedNumThread } : {}),
           },
           keep_alive: OLLAMA_KEEP_ALIVE,
@@ -2084,6 +2558,18 @@ router.post('/chat', async (req: Request, res: Response) => {
         const appendThinking = (content: string) => {
           if (!content) return;
           assistantThinking += content;
+          if (thinkBudgetForTurn > 0) {
+            const thinkBudgetChars = thinkBudgetForTurn * THINK_TOKENS_TO_CHARS;
+            if (assistantThinking.length > thinkBudgetChars && !thinkBudgetExceededThisTurn) {
+              thinkBudgetExceededThisTurn = true;
+              send('think_budget_exceeded', {
+                budget: thinkBudgetForTurn,
+                actual: Math.round(assistantThinking.length / THINK_TOKENS_TO_CHARS),
+                iteration: iterationNumber,
+              });
+              console.warn(`[think-budget] session=${sessionId} turn=${iterationNumber} budget=${thinkBudgetForTurn} actual≈${Math.round(assistantThinking.length / THINK_TOKENS_TO_CHARS)} tokens exceeded`);
+            }
+          }
           if (!caveman) {
             send('thinking', { content });
           }
@@ -2094,7 +2580,8 @@ router.post('/chat', async (req: Request, res: Response) => {
             tool_calls: pendingToolCalls,
           }]));
         };
-        const visibleContent = createVisibleContentFilter(appendThinking);
+        const startInsideThink = Boolean(think && capabilities.supportsThinking);
+        const visibleContent = createVisibleContentFilter(appendThinking, startInsideThink);
 
         const reader = ollamaResp.body!.getReader();
         const decoder = new TextDecoder();
@@ -2114,8 +2601,28 @@ router.post('/chat', async (req: Request, res: Response) => {
             let parsed: any;
             try { parsed = JSON.parse(trimmed); } catch { continue; }
 
+            if (parsed.done === true && parsed.done_reason === 'length') {
+              responseTruncated = true;
+            }
+
             const msg = parsed.message;
             if (!msg) continue;
+
+            if (msg.thinking) {
+              markGenerationStarted();
+              visibleContent.markNativeThinkingSeen();
+              appendThinking(msg.thinking);
+              // A pure-<think> stretch emits no visible content, so without a
+              // heartbeat here saveProgress never runs and the on-disk snapshot
+              // (updatedAt / hasStartedGenerating) stays frozen at request
+              // start — a reload or second tab then can't tell live thinking
+              // from a true hang. saveProgress is throttled to 750ms, so this is
+              // cheap. Surface the growing thought length so a reload shows
+              // movement, not just a fresher timestamp.
+              const run = activeRuns.get(sessionId);
+              if (run) run.statusText = `Thinking… (${assistantThinking.length} chars)`;
+              void saveProgress(assistantContent);
+            }
 
             if (msg.content) {
               markGenerationStarted();
@@ -2127,11 +2634,6 @@ router.post('/chat', async (req: Request, res: Response) => {
                 send('tokens', requestCtx.getTokenUsage([{ role: 'assistant', content: assistantContent }]));
                 void saveProgress(assistantContent);
               }
-            }
-
-            if (msg.thinking) {
-              markGenerationStarted();
-              appendThinking(msg.thinking);
             }
 
             if (msg.tool_calls?.length) {
@@ -2326,6 +2828,17 @@ router.post('/chat', async (req: Request, res: Response) => {
         continue;
       }
 
+      if (responseTruncated && !isNovelDraft && !ac.signal.aborted) {
+        // Give the next turn more room so a re-issued tool call (or answer) can
+        // complete. Any incomplete tool calls from this turn are still rejected
+        // below; the larger budget lets the model's retry actually fit.
+        const bumped = Math.min(outputNumPredict * 2, 32_768);
+        if (bumped > outputNumPredict) {
+          outputNumPredict = bumped;
+          send('status', { message: `Previous output hit the token limit; retrying with a larger budget (${outputNumPredict} tokens)…` });
+        }
+      }
+
       if (pendingToolCalls.length > 0 && !ac.signal.aborted) {
         if (forceFinalResponse) {
           // Reject any tool calls generated when tools are no longer available,
@@ -2358,37 +2871,82 @@ router.post('/chat', async (req: Request, res: Response) => {
 
         let toolBudgetExceeded = false;
         let limitReason = '';
+        let anyToolFailedInTurn = false;
         for (let i = 0; i < pendingToolCalls.length; i++) {
           const tc = pendingToolCalls[i];
 
-          if (toolCallCount >= MAX_TOOL_CALLS_PER_RUN || toolFailureCount >= MAX_TOOL_FAILURES_PER_RUN || searchFailureCount >= MAX_SEARCH_FAILURES_PER_RUN) {
-            toolBudgetExceeded = true;
-            limitReason = toolCallCount >= MAX_TOOL_CALLS_PER_RUN
-              ? `The research tool budget of ${MAX_TOOL_CALLS_PER_RUN} calls was reached.`
-              : searchFailureCount >= MAX_SEARCH_FAILURES_PER_RUN
-                ? 'Search providers repeatedly failed.'
-                : 'Research tools repeatedly failed.';
-
-            // Reject this and all subsequent tool calls in this turn to keep history valid
+          // Near-exhaustion: 3 of 4 tool failures. Before the next attempt burns
+          // the last failure and forces a final report, pause for human guidance
+          // so the user can approve a fix command or steer the agent off a loop
+          // (the gemma4 / `npx tailwindcss init -p` repeat-failure case).
+          if (!forceFinalResponse && consecutiveFailures >= NEAR_FAILURE_THRESHOLD && consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+            const lastFailName = lastToolMetadata?.name ?? 'unknown';
+            const lastFailOk = lastToolMetadata?.success ?? true;
+            const lastFailDesc = lastFailOk
+              ? 'multiple tool operations are failing in this run'
+              : `the last failing operation was \`${lastFailName}\``;
+            const decision = await pauseForUser({
+              kind: 'guidance',
+              prompt: `Tool failures are nearing the kill limit (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} consecutive); ${lastFailDesc}. How should I proceed? You can approve a specific fix command, give different instructions, or stop.`,
+              options: ['Approve a fix command', 'Give different instructions', 'Stop'],
+            });
+            if (!decision) break; // aborted
+            consecutiveFailures = 0;
+            recentFailures.length = 0;
+            let guidanceText: string;
+            if (decision.decision === 'timeout') {
+              guidanceText = 'The user did not respond within the time limit. Proceed with your best alternative, or stop if no safe path remains.';
+            } else if (decision.decision === 'approve' && decision.command) {
+              approvedCommands.add(normalizeCommand(decision.command));
+              guidanceText = `User approved running: \`${decision.command}\`. Run this exact command now with run_terminal.${decision.message ? ' Note: ' + decision.message : ''}`;
+            } else {
+              guidanceText = decision.message?.trim()
+                ? `User guidance: ${decision.message.trim()}`
+                : 'User did not provide specific guidance. Re-evaluate your approach and proceed, or stop if blocked.';
+            }
+            // Reject this and all remaining tool calls in this turn, then push
+            // the user's guidance as a user message so the next model turn sees it.
             for (let j = i; j < pendingToolCalls.length; j++) {
               const rejectTc = pendingToolCalls[j];
-              const toolName = rejectTc.function?.name ?? 'unknown_tool';
-              send('tool_start', { name: toolName, args: {} });
-              send('tool_result', {
-                name: toolName,
-                success: false,
-                output: `${limitReason} Tools are no longer available. Write the final report now.`,
-                durationMs: 0,
-              });
+              const rejectName = rejectTc.function?.name ?? 'unknown_tool';
+              send('tool_start', { name: rejectName, args: {} });
+              send('tool_result', { name: rejectName, success: false, output: 'Paused for user guidance. See the user message that follows.', durationMs: 0 });
               requestCtx.push({
                 role: 'tool',
-                content: `${limitReason} Tools are no longer available. Write the final report now using only successful tool results already provided. Do not call tools or invent sources.`,
-                tool_call_id: rejectTc.id ?? toolName,
-                tool_name: toolName,
+                content: 'Paused for user guidance before running. See the user message that follows.',
+                tool_call_id: rejectTc.id ?? rejectName,
+                tool_name: rejectName,
                 duration_ms: 0,
                 created_at: Date.now(),
               });
             }
+            requestCtx.push({ role: 'user', content: guidanceText, created_at: Date.now() });
+            if (isolated) ctx.push({ role: 'user', content: guidanceText, created_at: Date.now() });
+            await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+            break;
+          }
+
+          // 5 consecutive failures — kill the run for human review. The agent
+          // is stopped (not asked for a final report): the human reviews the
+          // transcript and resumes by sending a guiding message.
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            const failList = recentFailures.slice(-MAX_CONSECUTIVE_FAILURES)
+              .map((f, idx) => `${idx + 1}. ${f.name}: ${f.detail}`)
+              .join('\n');
+            const reviewMsg = `[SESSION KILLED — ${MAX_CONSECUTIVE_FAILURES} consecutive tool failures]\nThe agent was stopped for human review. Recent failures:\n${failList}\n\nReview the transcript, then guide the AI with a new message (the correct command, a different approach, or permission to install a missing dependency).`;
+            for (let j = i; j < pendingToolCalls.length; j++) {
+              const rejectTc = pendingToolCalls[j];
+              const rejectName = rejectTc.function?.name ?? 'unknown_tool';
+              send('tool_start', { name: rejectName, args: {} });
+              send('tool_result', { name: rejectName, success: false, output: 'Session killed: 5 consecutive failures. Stopped for human review.', durationMs: 0 });
+              requestCtx.push({ role: 'tool', content: 'Session killed: 5 consecutive failures. Stopped for human review.', tool_call_id: rejectTc.id ?? rejectName, tool_name: rejectName, duration_ms: 0, created_at: Date.now() });
+            }
+            requestCtx.push({ role: 'user', content: reviewMsg, created_at: Date.now() });
+            if (isolated) ctx.push({ role: 'user', content: reviewMsg, created_at: Date.now() });
+            send('killed', { reason: `${MAX_CONSECUTIVE_FAILURES} consecutive tool failures`, failures: recentFailures.slice(-MAX_CONSECUTIVE_FAILURES) });
+            await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+            killed = true;
+            terminalSent = true;
             break;
           }
 
@@ -2408,18 +2966,122 @@ router.post('/chat', async (req: Request, res: Response) => {
           }
           await saveProgress(assistantContent, true);
 
+          // Side-effecting install: pause for explicit user approval before the
+          // agent is allowed to mutate the environment (npm/pip/winget/etc.).
+          // On approval, allowlist the exact command and tell the agent to
+          // re-issue it — the agent runs the install itself via run_terminal.
+          if (toolName === 'run_terminal' && typeof args.command === 'string'
+              && isSideEffectingInstall(args.command)
+              && !autopilotInstalls
+              && !approvedCommands.has(normalizeCommand(args.command))) {
+            const decision = await pauseForUser({
+              kind: 'install',
+              prompt: `The agent wants to run an install command that changes your environment. Approve?`,
+              command: args.command,
+            });
+            if (!decision) break; // aborted
+            if (decision.decision === 'timeout') {
+              toolCallCount += 1;
+              toolFailureCount += 1;
+              consecutiveFailures += 1;
+              anyToolFailedInTurn = true;
+              recentFailures.push({ name: toolName, detail: `${args.command} → install not approved (user did not respond in time)` });
+              send('tool_result', { name: toolName, success: false, output: 'Install not approved: the user did not respond in time. Do not run this command. Find an alternative or stop.', durationMs: 0 });
+              requestCtx.push({ role: 'tool', content: 'Install not approved: the user did not respond in time. Do not run this command. Find an alternative or stop.', tool_call_id: tc.id ?? toolName, tool_name: toolName, duration_ms: 0, created_at: Date.now() });
+              continue;
+            }
+            if (decision.decision === 'deny') {
+              toolCallCount += 1;
+              toolFailureCount += 1;
+              consecutiveFailures += 1;
+              anyToolFailedInTurn = true;
+              const reason = decision.message ? ` Reason: ${decision.message}` : '';
+              recentFailures.push({ name: toolName, detail: `${args.command} → install denied by user${reason}` });
+              send('tool_result', { name: toolName, success: false, output: `User DENIED the install: ${args.command}.${reason} Do not run it. Find another approach.`, durationMs: 0 });
+              requestCtx.push({ role: 'tool', content: `User DENIED the install: ${args.command}.${reason} Do not run it. Find another approach.`, tool_call_id: tc.id ?? toolName, tool_name: toolName, duration_ms: 0, created_at: Date.now() });
+              continue;
+            }
+            // approve_all: approve this install AND flip the in-run autopilot
+            // on so all future side-effecting installs in this run bypass the
+            // approval gate (no more notifications). CRITICAL: we EXECUTE the
+            // command here rather than asking the agent to re-issue it. Weak
+            // local models (e.g. gemma4-uncensored) frequently ignore the
+            // "re-issue this exact command" instruction and try something else,
+            // which is how mkdir && npm install chains end up with the folder
+            // never created and the agent looping on the next failure.
+            if (decision.decision === 'approve_all') {
+              autopilotInstalls = true;
+              const approvedCmd = decision.command?.trim() || args.command;
+              approvedCommands.add(normalizeCommand(approvedCmd));
+              send('tool_start', { name: toolName, args });
+              const execStartedAt = Date.now();
+              const installResult = await runTool(toolName, { command: approvedCmd }, sessionId);
+              const execDurationMs = Date.now() - execStartedAt;
+              send('tool_result', {
+                name: toolName,
+                success: installResult.success,
+                output: (installResult.success
+                  ? `[AUTOPILOT — server executed this for you. All future installs in this run will also run automatically.]\n${installResult.output}`
+                  : `[AUTOPILOT — server executed this for you but it failed. Treat the failure below as a real failure (counts toward the kill limit).]\n${installResult.output}`
+                ).slice(0, 2000),
+                durationMs: execDurationMs,
+              });
+              requestCtx.push({
+                role: 'tool',
+                content: installResult.success
+                  ? `[AUTOPILOT — server executed this. All future installs in this run will also run automatically.]\n${installResult.output}`
+                  : `[AUTOPILOT — server executed this but it failed.]\n${installResult.output}`,
+                tool_call_id: tc.id ?? toolName,
+                tool_name: toolName,
+                duration_ms: execDurationMs,
+                created_at: Date.now(),
+              });
+              // Successful autopilot run resets the streak; failure counts as
+              // one (the model that proposed it shares blame).
+              toolCallCount += 1;
+              if (installResult.success) {
+                consecutiveFailures = 0;
+                recentFailures.length = 0;
+              } else {
+                toolFailureCount += 1;
+                consecutiveFailures += 1;
+                anyToolFailedInTurn = true;
+                recentFailures.push({ name: toolName, detail: `${approvedCmd} → ${installResult.output.slice(0, 200)}` });
+              }
+              continue;
+            }
+            // approve (or guidance carrying a command): allowlist + tell agent
+            const approvedCmd = decision.command?.trim() || args.command;
+            approvedCommands.add(normalizeCommand(approvedCmd));
+            // User approval is a success — reset the consecutive-failure streak.
+            consecutiveFailures = 0;
+            recentFailures.length = 0;
+            const note = decision.message ? ` Note: ${decision.message}` : '';
+            send('tool_result', { name: toolName, success: true, output: `User APPROVED running: \`${approvedCmd}\`. Re-issue this exact command now with run_terminal to perform the install.${note}`, durationMs: 0 });
+            requestCtx.push({ role: 'tool', content: `User APPROVED running: \`${approvedCmd}\`. Re-issue this exact command now with run_terminal to perform the install.${note}`, tool_call_id: tc.id ?? toolName, tool_name: toolName, duration_ms: 0, created_at: Date.now() });
+            continue;
+          }
+
           const toolStartedAt = Date.now();
           const result = toolName === 'browse_url' && !isBrowseUrlAllowed(args.url, requestCtx.getMessages())
             ? {
               success: false,
               output: `Browse denied: ${args.url} was not returned by a successful search and was not supplied by the user. Do not guess URLs; use only search-result links already in the context.`,
             }
-            : await runTool(toolName, args);
+            : await runTool(toolName, args, sessionId);
           const toolDurationMs = Date.now() - toolStartedAt;
           toolCallCount += 1;
           if (!result.success) {
             toolFailureCount += 1;
+            consecutiveFailures += 1;
+            anyToolFailedInTurn = true;
             if (toolName === 'web_search') searchFailureCount += 1;
+            const failArg = (args.command || args.query || args.url || args.filepath || '').slice(0, 120);
+            recentFailures.push({ name: toolName, detail: `${failArg} → ${result.output.slice(0, 200)}` });
+          } else {
+            // Any success resets the consecutive-failure streak.
+            consecutiveFailures = 0;
+            recentFailures.length = 0;
           }
           lastToolMetadata = { name: toolName, success: result.success, durationMs: toolDurationMs };
 
@@ -2457,10 +3119,11 @@ router.post('/chat', async (req: Request, res: Response) => {
           }
         }
 
+        lastToolWasError = anyToolFailedInTurn;
         send('tokens', requestCtx.getTokenUsage());
         await saveSessionToFile(sessionId, ctx, selectedPersona, model);
-        if (toolBudgetExceeded) {
-          forceFinalResponse = true;
+        if (killed) {
+          break; // 5 consecutive failures — exit the run for human review
         }
         continue;
       }
@@ -2468,10 +3131,19 @@ router.post('/chat', async (req: Request, res: Response) => {
       iterating = false;
       send('tokens', requestCtx.getTokenUsage());
       send('done', {});
+      terminalSent = true;
     }
 
     if (ac.signal.aborted) {
       send('stopped', {});
+      terminalSent = true;
+    } else if (!terminalSent) {
+      // Any non-abort exit that did not already emit 'done' (e.g. forced-final
+      // -response retry exhaustion) must still send one, or the client stream
+      // closes with no terminal event and the UI stays stuck as if running.
+      send('tokens', requestCtx.getTokenUsage());
+      send('done', {});
+      terminalSent = true;
     }
   } catch (err: any) {
     if (err.name !== 'AbortError') {
@@ -2510,6 +3182,9 @@ router.post('/chat', async (req: Request, res: Response) => {
   } finally {
     abortControllers.delete(sessionId);
     activeRuns.delete(sessionId);
+    // If the run was aborted while paused for approval, release the deferred
+    // so a stale /resume cannot resolve a dead promise.
+    resumeDeferred.delete(sessionId);
     await saveSessionToFile(sessionId, ctx, selectedPersona, model);
     res.end();
   }

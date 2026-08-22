@@ -3,6 +3,14 @@
  * Uses character estimation (÷4) for speed.
  */
 
+export interface AttachmentMeta {
+  name: string;
+  mimeType: string;
+  kind: 'image' | 'text';
+  /** Stored filename inside the session attachments dir (basename only). */
+  file: string;
+}
+
 export interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
@@ -12,6 +20,8 @@ export interface Message {
   tool_name?: string;
   duration_ms?: number;
   created_at?: number;
+  /** User-attached files (images/text). Bytes live on disk; this is metadata. */
+  attachments?: AttachmentMeta[];
 }
 
 export interface ToolCall {

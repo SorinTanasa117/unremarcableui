@@ -18,16 +18,16 @@
             "recommended_use": "Fast general instruction, creative writing, uncensored chat"
         },
         {
-            "id": "Dolphin3-0-R1-Mistral-24B-abliterated-Q4_K_M:latest",
+            "id": "GFalcon-UA/dolphin3-r1-mistral",
             "name": "Dolphin 3.0 R1 Mistral 24B",
-            "size_gb": 14.0,
+            "size_gb": 13.0,
             "max_context": 32768,
             "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": false,
                 "function_calling": true,
                 "thinking_mode": true,
-                "uncensored": true
+                "uncensored": false
             },
             "thinking_config": {
                 "tag": "think",
@@ -52,9 +52,9 @@
             "recommended_use": "STEM, mathematical reasoning, and logical problem solving"
         },
         {
-            "id": "qwen3-coder:30b",
+            "id": "qooba/qwen3-coder-30b-a3b-instruct:q3_k_m",
             "name": "Qwen3 Coder 30B (MoE)",
-            "size_gb": 18.0,
+            "size_gb": 14.0,
             "max_context": 262144,
             "quantization": "Q4_K_M",
             "capabilities": {
@@ -66,23 +66,27 @@
             "system_prompt_type": "qwen",
             "recommended_use": "Full codebase engineering, complex script generation, repository editing"
         },
-        {
-            "id": "smollm2:latest",
-            "name": "SmolLM2 1.7B",
-            "size_gb": 1.5,
-            "max_context": 8192,
-            "quantization": "Q4_K_M",
+   {
+            "id": "Qwen3-8-27_16k:latest",
+            "name": "Qwen 3.8 27B (Dense)",
+            "size_gb": 34.0,
+            "max_context": 262000,
+            "quantization": "none",
             "capabilities": {
-                "vision": false,
+                "vision": true,
                 "function_calling": true,
-                "thinking_mode": false,
+                "thinking_mode": true,
                 "uncensored": false
             },
-            "system_prompt_type": "chatml",
-            "recommended_use": "Ultra-lightweight tool calling, fast classification, low-RAM agent tasks"
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
+            },
+            "system_prompt_type": "qwen",
+            "recommended_use": "CPU-intensive dense model with reasoning support"
         },
         {
-            "id": "North-Mini-Code-1-0-GGUF:latest",
+            "id": "north-mini-code-1.0:latest",
             "name": "North Mini Code 1.0",
             "size_gb": 18.7,
             "max_context": 262144,
@@ -90,7 +94,7 @@
             "capabilities": {
                 "vision": false,
                 "function_calling": true,
-                "thinking_mode": false,
+                "thinking_mode": true,
                 "uncensored": false
             },
             "thinking_config": {
@@ -101,8 +105,8 @@
             "recommended_use": "Local coding assistance and fast script drafting"
         },
         {
-            "id": "Devstral-Small-2-24B-Q3_K_M:latest",
-            "name": "Devstral Small 2 24B",
+            "id": "devstral-small-2:latest",
+            "name": "Devstral Small 2 24B (Dense)",
             "size_gb": 11.0,
             "max_context": 262144,
             "quantization": "Q3_K_M",
@@ -116,9 +120,9 @@
             "recommended_use": "Software architecture, refactoring, and code analysis"
         },
         {
-            "id": "GPT_20B:latest",
+            "id": "gpt-oss-safeguard:20b",
             "name": "OpenAI GPT-OSS 20B (MoE)",
-            "size_gb": 13.0,
+            "size_gb": 14.0,
             "max_context": 131072,
             "quantization": "Q4_K_M",
             "capabilities": {
@@ -140,16 +144,16 @@
             "recommended_use": "Edge/Local reasoning, agentic tool execution, step-by-step problem solving"
         },
         {
-            "id": "Qwen3-6-27B-Q3_K_M:latest",
-            "name": "Qwen 3.6 27B (Q3 Quant)",
+            "id": "richardyoung/qwen3.6-27b-abliterated:Q4_K_M",
+            "name": "Qwen 3.6 27B (Dense)",
             "size_gb": 13.0,
             "max_context": 262144,
-            "quantization": "Q3_K_M",
+            "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": true,
                 "function_calling": true,
                 "thinking_mode": true,
-                "uncensored": false
+                "uncensored": true
             },
             "thinking_config": {
                 "tag": "think",
@@ -157,25 +161,6 @@
             },
             "system_prompt_type": "qwen",
             "recommended_use": "VRAM-efficient long context reasoning"
-        },
-        {
-            "id": "laguna-xs-2.1:q4_K_M",
-            "name": "Laguna XS 2.1",
-            "size_gb": 20.0,
-            "max_context": 262144,
-            "quantization": "Q4_K_M",
-            "capabilities": {
-                "vision": false,
-                "function_calling": true,
-                "thinking_mode": true,
-                "uncensored": false
-            },
-            "thinking_config": {
-                "tag": "think",
-                "default_enabled": true
-            },
-            "system_prompt_type": "chatml",
-            "recommended_use": "Agentic coding, terminal tasks, autonomous code execution"
         },
         {
             "id": "phi3:latest",
@@ -227,11 +212,11 @@
             "recommended_use": "Agent orchestration, structured workflow execution, multi-tool planning"
         },
         {
-            "id": "nemotron-3.5-lightning:latest",
-            "name": "NVIDIA Nemotron 3.5 Lightning 30B (MoE, 3B active)",
+            "id": "muse-glimmer:30b",
+            "name": "Muse Glimmer 30B (MoE, 3B active)",
             "size_gb": 18.0,
-            "max_context": 262144,
-            "quantization": "Q4_K_M",
+            "max_context": 128000,
+            "quantization": "none",
             "capabilities": {
                 "vision": false,
                 "function_calling": true,
@@ -247,7 +232,7 @@
         },
         {
             "id": "gemma4:26b-uncensored",
-            "name": "Huihui Gemma 4 26B Vision (Abliterated)",
+            "name": "Gemma 4 26B Vision (MoE)",
             "size_gb": 16.0,
             "max_context": 262144,
             "quantization": "Q4_K_M",

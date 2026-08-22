@@ -409,7 +409,7 @@ router.get('/:id', async (req: Request, res: Response) => {
   try {
     const novel = await storage.getNovel(id);
     if (!novel) {
-      res.status(404).json({ error: 'Novel not found' });
+      res.json(null);
       return;
     }
     res.json(novel);

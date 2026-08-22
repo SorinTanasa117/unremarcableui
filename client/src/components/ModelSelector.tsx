@@ -18,6 +18,19 @@ interface OllamaModel {
   sycl_reason?: string;
   size: number;
   modified_at: string;
+  is_loaded?: boolean;
+}
+
+interface LoadedResponse {
+  loaded: boolean;
+  models: Array<{
+    name: string;
+    model?: string;
+    size?: number;
+    sizeVram?: number;
+    expiresAt?: string;
+  }>;
+  backend: string;
 }
 
 interface ModelMapEntry {
@@ -62,8 +75,24 @@ export function ModelSelector({ value, onChange, disabled, persona, backend }: P
     staleTime: 60_000,
   });
 
+  const { data: loadedData } = useQuery<LoadedResponse>({
+    queryKey: ['ollama-loaded', backend],
+    queryFn: async () => {
+      const res = await fetch(`/api/ollama/loaded?backend=${backend}`);
+      if (!res.ok) throw new Error('Failed to fetch loaded model');
+      return res.json();
+    },
+    refetchInterval: 5_000,
+  });
+
   const models = data?.models ?? [];
   const modelMap = mapData?.models ?? [];
+  const loadedModels = loadedData?.models ?? [];
+
+  // Check if currently selected model is loaded
+  const isSelectedLoaded = loadedData?.loaded && loadedModels.some(
+    (lm) => lm.name === value || (lm.model && lm.model.startsWith(value)) || (value && lm.name.startsWith(value)),
+  );
 
   // Filter models based on persona
   const filteredModels = models.filter((m) => {
@@ -138,13 +167,15 @@ export function ModelSelector({ value, onChange, disabled, persona, backend }: P
         {displayModels.map((m) => {
           const mapDef = modelMap.find((item) => item.id === (m.map_id ?? m.name));
           const unavailableInSycl = backend === 'llamacpp' && m.sycl_available === false;
+          const isModelLoaded = m.is_loaded || loadedModels.some((lm) => lm.name === m.name || (lm.model && lm.model.startsWith(m.name)));
+          const prefix = isModelLoaded ? '● ' : '';
           const displayName = mapDef
-            ? `${mapDef.name} (${mapDef.size_gb}GB)`
+            ? `${prefix}${mapDef.name} (${mapDef.size_gb}GB)`
             : unavailableInSycl
-              ? `${m.display_name ?? m.name} (no local GGUF)`
-              : (m.display_name ?? m.name);
+              ? `${prefix}${m.display_name ?? m.name} (no local GGUF)`
+              : `${prefix}${m.display_name ?? m.name}`;
           const tooltip = mapDef
-            ? `${mapDef.recommended_use} | Quant: ${mapDef.quantization}`
+            ? `${mapDef.recommended_use} | Quant: ${mapDef.quantization}${isModelLoaded ? ' (Resident in VRAM)' : ''}`
             : unavailableInSycl
               ? (m.sycl_reason ?? 'Not available for local llama.cpp runtime (no local GGUF blob found).')
               : (m.display_name ? `Runtime model id: ${m.name}` : 'Runtime model');
@@ -155,6 +186,60 @@ export function ModelSelector({ value, onChange, disabled, persona, backend }: P
           );
         })}
       </select>
+      {/* Live resident/offloaded status pill */}
+      {value && !isLoading && !isError && (
+        <span
+          title={
+            isSelectedLoaded
+              ? `Model is currently resident in memory / VRAM (${backend})`
+              : loadedData?.loaded
+                ? `Another model is resident: ${loadedModels.map((m) => m.name).join(', ')}`
+                : `Model is offloaded from memory (${backend})`
+          }
+          style={{
+            fontSize: 11,
+            padding: '2px 7px',
+            borderRadius: '10px',
+            background: isSelectedLoaded
+              ? 'rgba(34, 197, 94, 0.12)'
+              : loadedData?.loaded
+                ? 'rgba(234, 179, 8, 0.12)'
+                : 'rgba(148, 163, 184, 0.10)',
+            color: isSelectedLoaded
+              ? 'var(--green, #22c55e)'
+              : loadedData?.loaded
+                ? 'var(--amber, #eab308)'
+                : 'var(--text-muted, #94a3b8)',
+            border: `1px solid ${
+              isSelectedLoaded
+                ? 'rgba(34, 197, 94, 0.3)'
+                : loadedData?.loaded
+                  ? 'rgba(234, 179, 8, 0.3)'
+                  : 'rgba(148, 163, 184, 0.2)'
+            }`,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            whiteSpace: 'nowrap',
+            userSelect: 'none',
+            flexShrink: 0,
+          }}
+        >
+          <span
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: '50%',
+              background: isSelectedLoaded
+                ? '#22c55e'
+                : loadedData?.loaded
+                  ? '#eab308'
+                  : '#94a3b8',
+            }}
+          />
+          {isSelectedLoaded ? 'In VRAM' : loadedData?.loaded ? 'Other Loaded' : 'Offloaded'}
+        </span>
+      )}
     </div>
   );
 }

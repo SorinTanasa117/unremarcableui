@@ -30,6 +30,7 @@
     "@xterm/xterm": "^5.5.0",
     "codemirror": "^6.0.0",
     "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
     "duck-duck-scrape": "^2.2.5",
     "express": "^4.21.2",
     "node-pty": "^1.0.0",
@@ -50,7 +51,10 @@
     "@types/react-dom": "^18.3.5",
     "@types/ws": "^8.5.13",
     "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.5.4",
     "concurrently": "^9.1.2",
+    "postcss": "^8.5.26",
+    "tailwindcss": "^4.3.3",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.7"

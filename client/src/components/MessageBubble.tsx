@@ -6,6 +6,8 @@ import type { ChatMessage } from '../hooks/useOllamaStream';
 interface Props {
   message: ChatMessage;
   isStreaming?: boolean;
+  /** Rerun this user prompt — discards everything from this point onward. */
+  onRerun?: () => void;
 }
 
 const toolIcons: Record<string, string> = {
@@ -64,8 +66,8 @@ function cleanModelOutput(text: string): string {
   return cleaned;
 }
 
-export function MessageBubble({ message, isStreaming }: Props) {
-  const { role, content, thinking, toolName, timestamp, durationMs, durationLabel } = message;
+export function MessageBubble({ message, isStreaming, onRerun }: Props) {
+  const { role, content, thinking, toolName, timestamp, durationMs, durationLabel, attachments, thinkBudgetExceeded } = message;
   const cleanedContent = cleanModelOutput(content);
 
   if (role === 'system') {
@@ -152,6 +154,56 @@ export function MessageBubble({ message, isStreaming }: Props) {
           lineHeight: 1.7,
           wordBreak: 'break-word',
         }}>
+          {attachments && attachments.length > 0 && (
+            <div style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: 8,
+              marginBottom: cleanedContent ? 10 : 0,
+            }}>
+              {attachments.map((att, idx) => (att.kind === 'image' && att.url) ? (
+                <a key={idx} href={att.url} target="_blank" rel="noreferrer" title={att.name}>
+                  <img
+                    src={att.url}
+                    alt={att.name}
+                    style={{
+                      maxWidth: 220,
+                      maxHeight: 220,
+                      borderRadius: 'var(--radius-md)',
+                      border: '1px solid var(--border)',
+                      display: 'block',
+                    }}
+                  />
+                </a>
+              ) : (
+                <a
+                  key={idx}
+                  href={att.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={att.name}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '4px 10px',
+                    borderRadius: 'var(--radius-md)',
+                    background: 'var(--bg-hover)',
+                    border: '1px solid var(--border)',
+                    color: 'var(--text-secondary)',
+                    fontSize: 12,
+                    textDecoration: 'none',
+                    maxWidth: 220,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  📎 {att.name}
+                </a>
+              ))}
+            </div>
+          )}
           {!isUser && thinking && (
             <div style={{
               marginBottom: content ? 10 : 0,
@@ -170,8 +222,26 @@ export function MessageBubble({ message, isStreaming }: Props) {
                 fontWeight: 700,
                 letterSpacing: '0.08em',
                 textTransform: 'uppercase',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
               }}>
-                Thinking process
+                <span>Thinking process</span>
+                {thinkBudgetExceeded && (
+                  <span style={{
+                    color: 'var(--amber)',
+                    fontSize: 9,
+                    fontWeight: 600,
+                    textTransform: 'none',
+                    letterSpacing: 'normal',
+                    background: 'rgba(245,166,35,0.12)',
+                    padding: '1px 5px',
+                    borderRadius: 3,
+                    border: '1px solid rgba(245,166,35,0.3)',
+                  }}>
+                    ⚠️ budget limit exceeded
+                  </span>
+                )}
               </div>
               <pre style={{
                 margin: 0,
@@ -222,6 +292,26 @@ export function MessageBubble({ message, isStreaming }: Props) {
               {durationLabel ?? 'Generated in'} {formatDuration(durationMs)}
             </span>
           </>
+        )}
+        {isUser && onRerun && !isStreaming && (
+          <button
+            onClick={onRerun}
+            title="Rerun from here — discards this message and everything after"
+            style={{
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              fontSize: 11,
+              padding: '0 2px',
+              color: 'var(--text-muted)',
+              opacity: 0.6,
+              lineHeight: 1,
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; e.currentTarget.style.color = 'var(--accent-light)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.opacity = '0.6'; e.currentTarget.style.color = 'var(--text-muted)'; }}
+          >
+            ↺ rerun
+          </button>
         )}
       </div>
     </div>

@@ -20,10 +20,9 @@ export default defineConfig({
         target: 'http://localhost:5050',
         changeOrigin: true,
         ws: true,
-        // Devstral can take several minutes to load and begin generating on
-        // CPU. Keep the browser's streaming proxy alive for long agent runs.
-        timeout: 30 * 60 * 1000,
-        proxyTimeout: 30 * 60 * 1000,
+        // No proxy timeouts on agent session streams.
+        timeout: 0,
+        proxyTimeout: 0,
       },
       '/ws': {
         target: 'ws://localhost:5050',

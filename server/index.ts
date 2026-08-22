@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
@@ -5,13 +6,14 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import ollamaRouter from './routes/ollama.js';
+import cloudRouter from './routes/cloud.js';
 import filesRouter from './routes/files.js';
 import toolsRouter from './routes/tools.js';
 import novelsRouter from './routes/novels.js';
 import { setupTerminalWS } from './routes/terminal.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 5050;
+const PORT = Number.parseInt(process.env.PORT ?? '5050', 10);
 
 const app = express();
 app.use(cors());
@@ -25,6 +27,7 @@ app.use((req, _res, next) => {
 
 // REST routes
 app.use('/api/ollama', ollamaRouter);
+app.use('/api/cloud', cloudRouter);
 app.use('/api/files', filesRouter);
 app.use('/api/tools', toolsRouter);
 app.use('/api/novels', novelsRouter);
@@ -34,11 +37,12 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
 
-// Agent responses can stream through multiple model and tool turns. Node defaults
-// request timeouts to five minutes, which prematurely ends longer runs.
-const AGENT_RUN_TIMEOUT_MS = 30 * 60 * 1000;
-server.requestTimeout = AGENT_RUN_TIMEOUT_MS;
-server.timeout = AGENT_RUN_TIMEOUT_MS;
+// Agent responses can stream through multiple model and tool turns without arbitrary time limits.
+// Setting requestTimeout, timeout, and headersTimeout to 0 disables Node's default timeouts.
+server.requestTimeout = 0;
+server.timeout = 0;
+server.headersTimeout = 0;
+server.keepAliveTimeout = 0;
 
 // WebSocket server — route manually on upgrade
 const wss = new WebSocketServer({ noServer: true });

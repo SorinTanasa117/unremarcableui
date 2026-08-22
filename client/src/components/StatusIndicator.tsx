@@ -12,6 +12,7 @@ const icons: Record<AgentStatus, string> = {
   tool: '⚙',
   stopped: '■',
   error: '✕',
+  paused: '⏸',
 };
 
 const colors: Record<AgentStatus, string> = {
@@ -20,6 +21,7 @@ const colors: Record<AgentStatus, string> = {
   tool: 'var(--amber)',
   stopped: 'var(--text-muted)',
   error: 'var(--red)',
+  paused: 'var(--amber)',
 };
 
 export function StatusIndicator({ status, statusText }: Props) {

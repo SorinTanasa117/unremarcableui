@@ -66,3 +66,41 @@ export function playChime(): void {
     osc.stop(note.start + note.duration + 0.02);
   }
 }
+
+/**
+ * Play a soft ascending three-note arpeggio (C5 → E5 → G5). Intentionally
+ * distinct from `playChime` (which is a descending two-note end-of-session
+ * tone): this one rises, signalling "your turn — the agent paused and is
+ * waiting for input." Same low master volume and sine-only timbre.
+ */
+export function playPauseChime(): void {
+  const c = getCtx();
+  if (!c || !masterGain) return;
+  if (c.state === 'suspended') {
+    void c.resume();
+  }
+
+  const now = c.currentTime;
+  // Ascending C major triad — a gentle "attention, over to you" cue.
+  const notes = [
+    { freq: 523.25, start: now + 0.00, duration: 0.30 },
+    { freq: 659.25, start: now + 0.14, duration: 0.32 },
+    { freq: 783.99, start: now + 0.28, duration: 0.50 },
+  ];
+
+  for (const note of notes) {
+    const osc = c.createOscillator();
+    const gain = c.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(note.freq, note.start);
+
+    gain.gain.setValueAtTime(0.0001, note.start);
+    gain.gain.exponentialRampToValueAtTime(0.6, note.start + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.0001, note.start + note.duration);
+
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start(note.start);
+    osc.stop(note.start + note.duration + 0.02);
+  }
+}

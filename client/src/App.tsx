@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { ChatPanel } from './components/ChatPanel';
 import { FileExplorer } from './components/FileExplorer';
 import { FileEditor } from './components/FileEditor';
@@ -7,9 +7,11 @@ import { ModelSelector } from './components/ModelSelector';
 import { StatusIndicator } from './components/StatusIndicator';
 import { ProgressBar } from './components/ProgressBar';
 import { NovelStudio } from './components/NovelStudio';
+import { CloudProviderModal } from './components/CloudProviderModal';
 import { useOllamaStream, type InferenceBackend } from './hooks/useOllamaStream';
 import { formatTokenRate } from './lib/tokenCounter';
-import { playChime, unlockAudio } from './lib/chime';
+import { playChime, playPauseChime, unlockAudio } from './lib/chime';
+import { useCloudProviderSettings } from './lib/providerConfig';
 
 function generateSessionId() {
   return `session_${Math.random().toString(36).slice(2, 11)}`;
@@ -35,6 +37,7 @@ export default function App() {
     tokenUsage,
     tokenRates,
     sendMessage,
+    rerunFrom,
     stop,
     killModel,
     resetSession,
@@ -42,17 +45,33 @@ export default function App() {
     sessionsList,
     fetchSessionsList,
     deleteSession,
+    stalledMs,
+    autoStopNotice,
+    clearAutoStopNotice,
+    pendingAskUser,
+    resumeSession,
+    clearPendingAskUser,
   } = useOllamaStream();
 
   const [model, setModel] = useState('');
+  const { settings: cloudSettings, setSettings: setCloudSettings } = useCloudProviderSettings();
+  const [cloudMode, setCloudMode] = useState(() => localStorage.getItem('ollama_cloud_mode') === 'true');
+  const [cloudModalOpen, setCloudModalOpen] = useState(false);
+  const [askUserGuidance, setAskUserGuidance] = useState('');
+  const activeModel = cloudMode ? cloudSettings.model : model;
+  const activeCloudProvider = cloudMode ? cloudSettings : undefined;
   const [inferenceBackend, setInferenceBackend] = useState<InferenceBackend>(() =>
     localStorage.getItem('ollama_inference_backend') === 'llamacpp' ? 'llamacpp' : 'ollama'
   );
   const [contextSize, setContextSize] = useState(() => Number(localStorage.getItem('ollama_context_size')) || 32_768);
   const [thinkingMode, setThinkingMode] = useState(false);
-  const [numThread, setNumThread] = useState(() => Number(localStorage.getItem('ollama_num_thread')) === 8 ? 8 : 6);
+  const numThread = 8; // hardcoded — threads selector removed from UI
   const [cavemanMode, setCavemanMode] = useState(() => localStorage.getItem('ollama_caveman_mode') === 'true');
   const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem('ollama_sound_enabled') !== 'false');
+  // Autopilot for installs: when on, side-effecting installs (npm/pip/winget/
+  // etc.) run without per-command approval for the rest of the run. Opt in at
+  // session start; persists across reloads and stays on until toggled off.
+  const [autopilotInstalls, setAutopilotInstalls] = useState(() => localStorage.getItem('ollama_autopilot_installs') === 'true');
   const [modelMap, setModelMap] = useState<any>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   // Folder open/closed state lives at the App root so it is preserved when the
@@ -88,10 +107,10 @@ export default function App() {
 
   // Sync thinking mode and context size with the selected model's capabilities
   useEffect(() => {
-    if (inferenceBackend === 'llamacpp') {
+    if (cloudMode || inferenceBackend === 'llamacpp') {
       setThinkingMode(false);
     }
-    if (!modelMap || !model) return;
+    if (cloudMode || !modelMap || !model) return;
     const currentModelDef = modelMap.models?.find((m: any) => m.id === model);
     if (!currentModelDef) return;
 
@@ -108,7 +127,7 @@ export default function App() {
       const best = [...CONTEXT_SIZES].reverse().find((s) => s <= modelMax);
       if (best) setContextSize(best);
     }
-  }, [model, modelMap, inferenceBackend, contextSize]);
+  }, [model, modelMap, inferenceBackend, contextSize, cloudMode]);
 
   // Active Session Persistence
   const [activeSessionId, setActiveSessionId] = useState<string>(() => {
@@ -126,6 +145,20 @@ export default function App() {
   // into their edges (Alt+C / Alt+T also work).
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
+
+  // Drag-to-resize panel widths (persisted to localStorage)
+  const [sidebarWidth, setSidebarWidth] = useState(() =>
+    Number(localStorage.getItem('ollama_sidebar_width')) || 230
+  );
+  const [rightPanelWidth, setRightPanelWidth] = useState(() =>
+    Number(localStorage.getItem('ollama_right_panel_width')) || 480
+  );
+  const dragRef = useRef<{
+    target: 'sidebar' | 'right';
+    startX: number;
+    startWidth: number;
+  } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
   const [rightPanelTab, setRightPanelTab] = useState<RightTab>('terminal');
   const [novelOutlineReady, setNovelOutlineReady] = useState(false);
   const [novelFirstChapter, setNovelFirstChapter] = useState<{ number: number; title: string } | null>(null);
@@ -146,6 +179,38 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
+  // Panel drag-to-resize
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (!dragRef.current) return;
+      e.preventDefault();
+      const delta = e.clientX - dragRef.current.startX;
+      if (dragRef.current.target === 'sidebar') {
+        const next = Math.max(160, Math.min(520, dragRef.current.startWidth + delta));
+        setSidebarWidth(next);
+        localStorage.setItem('ollama_sidebar_width', String(next));
+      } else {
+        const next = Math.max(280, Math.min(window.innerWidth - 320, dragRef.current.startWidth - delta));
+        setRightPanelWidth(next);
+        localStorage.setItem('ollama_right_panel_width', String(next));
+      }
+    };
+    const onMouseUp = () => {
+      if (dragRef.current) {
+        dragRef.current = null;
+        setIsDragging(false);
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      }
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, []);
+
   // Load session list on startup
   useEffect(() => {
     fetchSessionsList();
@@ -159,17 +224,23 @@ export default function App() {
     localStorage.setItem('ollama_caveman_mode', String(cavemanMode));
   }, [cavemanMode]);
 
-  useEffect(() => {
-    localStorage.setItem('ollama_num_thread', String(numThread));
-  }, [numThread]);
+
 
   useEffect(() => {
     localStorage.setItem('ollama_inference_backend', inferenceBackend);
   }, [inferenceBackend]);
 
   useEffect(() => {
+    localStorage.setItem('ollama_cloud_mode', String(cloudMode));
+  }, [cloudMode]);
+
+  useEffect(() => {
     localStorage.setItem('ollama_sound_enabled', String(soundEnabled));
   }, [soundEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem('ollama_autopilot_installs', String(autopilotInstalls));
+  }, [autopilotInstalls]);
 
   // Play a soft chime when a streaming session reaches a terminal state.
   // Only fires on the transition out of an active run — page loads and
@@ -181,6 +252,11 @@ export default function App() {
     const nowTerminal = status === 'idle' || status === 'stopped' || status === 'error';
     if (wasActive && nowTerminal && soundEnabled) {
       playChime();
+    }
+    // Distinct ascending cue when the agent pauses for user input (ask_user).
+    // Same sound toggle as the end-of-session chime — no separate setting.
+    if (wasActive && status === 'paused' && soundEnabled) {
+      playPauseChime();
     }
     prevStatusRef.current = status;
   }, [status, soundEnabled]);
@@ -220,7 +296,7 @@ export default function App() {
   const startNewChat = (persona: PersonaType = 'coder') => {
     const newId = generateSessionId();
     newSessionPersonas.current.set(newId, persona);
-    newSessionModels.current.set(newId, model);
+    newSessionModels.current.set(newId, activeModel);
     setActivePersona(persona);
     setActiveSessionId(newId);
   };
@@ -234,7 +310,7 @@ export default function App() {
         sessionId: newId,
         title: `${title} — Outline`,
         persona: 'novelist',
-        model,
+        model: activeModel,
       }),
     });
     const data = await res.json().catch(() => ({}));
@@ -242,7 +318,7 @@ export default function App() {
       throw new Error(data.error || 'Failed to create dedicated novel chat');
     }
     newSessionPersonas.current.set(newId, 'novelist');
-    newSessionModels.current.set(newId, model);
+    newSessionModels.current.set(newId, activeModel);
     await fetchSessionsList();
     return newId;
   };
@@ -272,92 +348,96 @@ export default function App() {
 
   const isRunning = status === 'thinking' || status === 'tool';
 
+
+
   return (
     <div style={{ height: '100vh', width: '100vw', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--bg-base)' }}>
-      {/* ── Top Bar ── */}
-      <header style={{
+      {/* ── Top Bar (single row — icon toggles keep it compact) ── */}
+      <header className="toolbar-row" style={{
         height: 52,
-        display: 'flex',
-        alignItems: 'center',
-        gap: 12,
-        padding: '0 16px',
+        display: 'flex', alignItems: 'center', gap: 10,
+        padding: '0 14px',
         background: 'var(--bg-surface)',
         borderBottom: '1px solid var(--border)',
-        flexShrink: 0,
-        zIndex: 10,
+        flexShrink: 0, zIndex: 10,
+        overflowX: 'auto',
       }}>
         {/* Logo */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginRight: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0, marginRight: 4 }}>
           <div style={{
-            width: 30, height: 30, borderRadius: '50%',
+            width: 28, height: 28, borderRadius: '50%',
             background: 'linear-gradient(135deg, var(--accent), var(--cyan))',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 16, boxShadow: '0 0 12px var(--accent-glow)',
+            fontSize: 15, boxShadow: '0 0 10px var(--accent-glow)',
           }}>✦</div>
-          <span style={{ fontWeight: 700, fontSize: 14, background: 'linear-gradient(90deg, var(--accent-light), var(--cyan))', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+          <span style={{ fontWeight: 700, fontSize: 13, whiteSpace: 'nowrap', background: 'linear-gradient(90deg, var(--accent-light), var(--cyan))', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
             Ollama Agent
           </span>
         </div>
 
-        {/* Model selector */}
-        <ModelSelector value={model} onChange={setModel} disabled={isRunning} persona={activePersona} backend={inferenceBackend} />
+        {/* Model */}
+        <div style={{ flexShrink: 0 }}>
+          {cloudMode ? (
+            <button className="btn" onClick={() => setCloudModalOpen(true)} disabled={isRunning}
+              title="Configure cloud provider and model"
+              style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--cyan)' }}>
+              ☁ {cloudSettings.model || 'Configure cloud model'}
+            </button>
+          ) : (
+            <ModelSelector value={model} onChange={setModel} disabled={isRunning} persona={activePersona} backend={inferenceBackend} />
+          )}
+        </div>
 
-        <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
-          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Runtime</span>
-          <select
-            value={inferenceBackend}
-            onChange={(event) => setInferenceBackend(event.target.value as InferenceBackend)}
-            disabled={isRunning}
-            title="Select inference runtime backend"
-            style={{ padding: '5px 8px', fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}
-          >
+        {/* Runtime */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, borderLeft: '1px solid var(--border)', paddingLeft: 10, flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>Runtime</span>
+          <select value={inferenceBackend} onChange={(e) => setInferenceBackend(e.target.value as InferenceBackend)}
+            disabled={isRunning || cloudMode} title="Select inference runtime backend"
+            style={{ padding: '4px 7px', fontSize: 11, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}>
             <option value="ollama">Ollama (CPU/Vulkan)</option>
             <option value="llamacpp">llama.cpp SYCL</option>
           </select>
         </div>
 
+        {/* Cloud */}
+        <button className={cloudMode ? 'btn btn-primary' : 'btn'}
+          onClick={() => { if (cloudMode) setCloudMode(false); else setCloudModalOpen(true); }}
+          disabled={isRunning}
+          title={cloudMode ? 'Switch back to local runtime' : 'Configure cloud provider'}
+          style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>
+          {cloudMode ? '☁ Cloud on' : '☁ Cloud'}
+        </button>
+
+        <div style={{ width: 1, height: 22, background: 'var(--border)', flexShrink: 0 }} />
+
+        {/* Context size */}
         {(() => {
-          const currentModelDef = modelMap?.models?.find((m: any) => m.id === model);
+          const currentModelDef = cloudMode ? undefined : modelMap?.models?.find((m: any) => m.id === model);
           const modelMax: number | undefined = currentModelDef?.max_context;
-          const allowedSizes = modelMax
-            ? CONTEXT_SIZES.filter((s) => s <= modelMax)
-            : CONTEXT_SIZES;
+          const allowedSizes = cloudMode ? CONTEXT_SIZES : modelMax
+            ? CONTEXT_SIZES.filter((s) => s <= modelMax) : CONTEXT_SIZES;
           return (
-            <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
-              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Context</span>
-              <select
-                value={contextSize}
-                onChange={(event) => setContextSize(Number(event.target.value))}
-                disabled={isRunning}
-                title="Context window used for the next model run"
-                style={{ padding: '5px 8px', fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}
-              >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>Context</span>
+              <select value={contextSize} onChange={(e) => setContextSize(Number(e.target.value))}
+                disabled={isRunning} title="Context window used for the next model run"
+                style={{ padding: '4px 6px', fontSize: 11, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}>
                 {allowedSizes.map((size) => <option key={size} value={size}>{size / 1024}k</option>)}
               </select>
             </div>
           );
         })()}
 
+        <div style={{ width: 1, height: 22, background: 'var(--border)', flexShrink: 0 }} />
 
-        {/* Persona selector — placed right after context, before the toggles */}
-        <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
-          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Persona</span>
-          <select
-            id="persona-selector"
-            value={activePersona}
+        {/* Mode (persona) */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>Mode</span>
+          <select id="persona-selector" value={activePersona}
             onChange={(e) => setActivePersona(e.target.value as PersonaType)}
             disabled={isRunning || messages.length > 0}
-            style={{
-              padding: '5px 10px',
-              fontSize: 12,
-              background: 'var(--bg-card)',
-              border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-md)',
-              color: 'var(--text-primary)',
-              cursor: messages.length > 0 ? 'not-allowed' : 'pointer',
-            }}
-            title={messages.length > 0 ? "Reset conversation to change persona" : "Select AI Agent Persona"}
-          >
+            style={{ padding: '4px 7px', fontSize: 11, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', cursor: messages.length > 0 ? 'not-allowed' : 'pointer' }}
+            title={messages.length > 0 ? 'Reset conversation to change mode' : 'Select AI Agent Mode'}>
             <option value="coder">💻 Coder</option>
             <option value="researcher">🔍 Researcher</option>
             <option value="creative">✍ Creative</option>
@@ -366,112 +446,226 @@ export default function App() {
           </select>
         </div>
 
-        {/* Thinking mode toggle */}
+        {/* Spacer */}
+        <div style={{ flex: 1, minWidth: 8 }} />
+
+        {/* ── Icon toggles: Thinking + Caveman ── */}
         {(() => {
-          const selectedModelDef = modelMap?.models?.find((m: any) => m.id === model);
-          const supportsThinking = inferenceBackend === 'ollama' && (selectedModelDef ? (selectedModelDef.capabilities?.thinking_mode ?? false) : true);
+          const selectedModelDef = cloudMode ? undefined : modelMap?.models?.find((m: any) => m.id === model);
+          const supportsThinking = !cloudMode && inferenceBackend === 'ollama'
+            && (selectedModelDef ? (selectedModelDef.capabilities?.thinking_mode ?? false) : true);
+
+          const thinkTitle = supportsThinking
+            ? (thinkingMode ? 'Thinking — ON (click to disable)' : 'Thinking — OFF (click to enable)')
+            : cloudMode ? 'Thinking — not available for cloud providers'
+            : inferenceBackend === 'llamacpp' ? 'Thinking — not available on llama.cpp'
+            : 'Thinking — not supported by this model';
+
+          const cavemanTitle = cavemanMode
+            ? 'Caveman — ON · 65% fewer tokens, same accuracy (click to disable)'
+            : 'Caveman — OFF · click to enable compressed responses';
+
           return (
-            <label
-              className="flex items-center gap-2"
-              style={{
-                fontSize: 12,
-                color: supportsThinking ? 'var(--text-secondary)' : 'var(--text-muted)',
-                cursor: (isRunning || !supportsThinking) ? 'not-allowed' : 'pointer',
-                opacity: supportsThinking ? 1 : 0.5,
-              }}
-              title={supportsThinking
-                ? 'Use model reasoning when supported'
-                : inferenceBackend === 'llamacpp'
-                  ? 'Thinking mode is disabled on llama.cpp SYCL runtime'
-                  : 'Thinking mode not supported by this model'}
-            >
-              <input
-                type="checkbox"
-                checked={thinkingMode}
-                onChange={(event) => setThinkingMode(event.target.checked)}
-                disabled={isRunning || !supportsThinking}
-              />
-              Thinking mode
-            </label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
+              {/* 🧠 Thinking toggle */}
+              <button
+                onClick={() => { if (supportsThinking && !isRunning) setThinkingMode((v) => !v); }}
+                title={thinkTitle}
+                aria-label="Thinking"
+                style={{
+                  width: 32, height: 32, borderRadius: '50%', border: '1.5px solid',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 16, padding: 0,
+                  cursor: (!supportsThinking || isRunning) ? 'not-allowed' : 'pointer',
+                  opacity: isRunning ? 0.5 : (!supportsThinking ? 0.3 : 1),
+                  background: !supportsThinking
+                    ? 'var(--bg-card)'
+                    : thinkingMode
+                      ? 'rgba(57,217,138,0.15)'
+                      : 'rgba(240,96,112,0.12)',
+                  borderColor: !supportsThinking
+                    ? 'var(--border)'
+                    : thinkingMode ? 'var(--green)' : 'rgba(240,96,112,0.55)',
+                  transition: 'background 0.2s, border-color 0.2s',
+                }}
+              >🧠</button>
+
+              {/* 🪵 Caveman toggle */}
+              <button
+                onClick={() => { if (!isRunning) setCavemanMode((v) => !v); }}
+                title={cavemanTitle}
+                aria-label="Caveman"
+                style={{
+                  width: 32, height: 32, borderRadius: '50%', border: '1.5px solid',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 16, padding: 0,
+                  cursor: isRunning ? 'not-allowed' : 'pointer',
+                  opacity: isRunning ? 0.5 : 1,
+                  background: cavemanMode ? 'rgba(57,217,138,0.15)' : 'rgba(240,96,112,0.12)',
+                  borderColor: cavemanMode ? 'var(--green)' : 'rgba(240,96,112,0.55)',
+                  transition: 'background 0.2s, border-color 0.2s',
+                }}
+              >🪵</button>
+            </div>
           );
         })()}
 
-        {/* Thread tuning selector */}
-        <div className="flex items-center gap-2" style={{ borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
-          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Threads</span>
-          <select
-            value={numThread}
-            onChange={(event) => setNumThread(Number(event.target.value))}
-            disabled={isRunning || inferenceBackend === 'llamacpp'}
-            title={inferenceBackend === 'ollama'
-              ? 'Thread count sent as num_thread on each request'
-              : 'Thread count applies to Ollama runtime only'}
-            style={{ padding: '5px 8px', fontSize: 12, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', color: 'var(--text-primary)' }}
-          >
-            <option value={6}>6 (P-core focus)</option>
-            <option value={8}>8 (broader)</option>
-          </select>
-        </div>
-
-        {/* Caveman mode toggle */}
-        <label
-          className="flex items-center gap-2"
-          style={{
-            fontSize: 12,
-            color: cavemanMode ? 'var(--amber, #f59e0b)' : 'var(--text-secondary)',
-            cursor: isRunning ? 'not-allowed' : 'pointer',
-            opacity: isRunning ? 0.5 : 1,
-            transition: 'color 0.2s',
-          }}
-          title="Caveman mode — same answers, 65% fewer output tokens. Drops filler words and pleasantries, keeps full technical accuracy."
-        >
-          <input
-            type="checkbox"
-            checked={cavemanMode}
-            onChange={(e) => setCavemanMode(e.target.checked)}
-            disabled={isRunning}
-          />
-          🪨 Caveman
-        </label>
-
-        {/* Spacer — pushes token bar to the right */}
-        <div style={{ flex: 1 }} />
-
-        {/* Token bar with Context label, plus live read/write token speeds */}
-        <div
-          className="flex items-stretch gap-2"
-          style={{
-            borderLeft: '1px solid var(--border)',
-            paddingLeft: 12,
-            minWidth: 240,
-          }}
-        >
-          <div className="flex flex-col justify-center" style={{ gap: 1 }}>
-            <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>Context</span>
-            <div
-              className="flex items-center"
-              style={{ gap: 10, fontSize: 10.5, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}
-              title="Live prompt prefill (read) and token generation (write) throughput, computed from the last 8 SSE token-counter samples."
-            >
-              <span style={{ color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                👁 <span style={{ color: 'var(--text-muted)' }}>Read</span>
-                <span style={{ color: tokenRates.read > 0 ? 'var(--cyan)' : 'var(--text-muted)' }}>
-                  {formatTokenRate(tokenRates.read)} t/s
-                </span>
+        {/* Token bar */}
+        <div style={{ display: 'flex', alignItems: 'stretch', gap: 8, flexShrink: 0, borderLeft: '1px solid var(--border)', paddingLeft: 12 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 1 }}>
+            <span style={{ fontSize: 10, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>Context usage</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 10, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}
+              title="Live prompt prefill (read) and token generation (write) throughput.">
+              <span style={{ color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                👁 <span style={{ color: 'var(--text-muted)' }}>R</span>
+                <span style={{ color: tokenRates.read > 0 ? 'var(--cyan)' : 'var(--text-muted)' }}>{formatTokenRate(tokenRates.read)} t/s</span>
               </span>
-              <span style={{ color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                ⌨ <span style={{ color: 'var(--text-muted)' }}>Write</span>
-                <span style={{ color: tokenRates.write > 0 ? 'var(--accent-light)' : 'var(--text-muted)' }}>
-                  {formatTokenRate(tokenRates.write)} t/s
-                </span>
+              <span style={{ color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                ⌨ <span style={{ color: 'var(--text-muted)' }}>W</span>
+                <span style={{ color: tokenRates.write > 0 ? 'var(--accent-light)' : 'var(--text-muted)' }}>{formatTokenRate(tokenRates.write)} t/s</span>
               </span>
             </div>
           </div>
           <ProgressBar input={tokenUsage.input} output={tokenUsage.output} />
         </div>
-
-
       </header>
+
+      {/* ── Run status banner ─────────────────────────────────────────────
+           Three states:
+           1. autoStopNotice  — run was auto-stopped; persists until dismissed
+                                or the next message is sent.
+           2. active stall    — run is still live but silent > 90 s; offer
+                                manual Force Stop while auto-stop fires within
+                                the next 10-s interval.
+           Both share the same red strip so the UI is consistent.
+      ──────────────────────────────────────────────────────────────────── */}
+      {(autoStopNotice || (stalledMs > 0 && isRunning)) && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 12,
+          padding: '7px 16px',
+          background: autoStopNotice ? 'rgba(240,96,112,0.05)' : 'rgba(240,96,112,0.08)',
+          borderBottom: '1px solid rgba(240,96,112,0.35)',
+          borderLeft: '3px solid var(--red)',
+          flexShrink: 0, zIndex: 9,
+        }}>
+          <span style={{ fontSize: 15 }}>{autoStopNotice?.includes('⚡') ? '⚡' : autoStopNotice ? '🛑' : '⏳'}</span>
+          <span style={{ fontSize: 12, color: 'var(--red)', fontWeight: 600, whiteSpace: 'nowrap' }}>
+            {autoStopNotice?.includes('⚡') ? 'Model Offloaded' : autoStopNotice ? 'Stopped' : 'Quiet Run'}
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--text-secondary)', flex: 1 }}>
+            {autoStopNotice ?? (
+              `No activity for ${
+                Math.floor(stalledMs / 60000) > 0
+                  ? `${Math.floor(stalledMs / 60000)}m ${Math.round((stalledMs % 60000) / 1000)}s`
+                  : `${Math.round(stalledMs / 1000)}s`
+              }. Run continues indefinitely until complete or stopped.`
+            )}
+          </span>
+          {autoStopNotice ? (
+            <button
+              onClick={clearAutoStopNotice}
+              style={{
+                padding: '4px 12px', fontSize: 11, fontWeight: 600,
+                background: 'transparent', color: 'var(--text-muted)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-md)',
+                cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
+              }}
+            >
+              Dismiss
+            </button>
+          ) : (
+            <button
+              onClick={() => stop(activeSessionId)}
+              style={{
+                padding: '4px 12px', fontSize: 11, fontWeight: 600,
+                background: 'var(--red)', color: '#fff',
+                border: 'none', borderRadius: 'var(--radius-md)',
+                cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
+              }}
+            >
+              Force Stop
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* ── ask_user pause banner ──────────────────────────────────────────
+           The agent paused for human input: either it wants to run a
+           side-effecting install (approve/deny) or it has burned 3/4 tool
+           failures and needs guidance. The run stays alive server-side
+           (heartbeated) until the user responds via /api/ollama/resume.
+      ──────────────────────────────────────────────────────────────────── */}
+      {pendingAskUser && (
+        <div style={{
+          display: 'flex', flexDirection: 'column', gap: 10,
+          padding: '12px 16px',
+          background: 'rgba(250,176,5,0.06)',
+          borderBottom: '1px solid rgba(250,176,5,0.4)',
+          borderLeft: '3px solid var(--amber, #f59e0b)',
+          flexShrink: 0, zIndex: 9,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontSize: 15 }}>⏸️</span>
+            <span style={{ fontSize: 12, color: 'var(--amber, #f59e0b)', fontWeight: 700, whiteSpace: 'nowrap' }}>
+              Agent paused — needs your input
+            </span>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{pendingAskUser.prompt}</div>
+          {pendingAskUser.command && (
+            <pre style={{
+              margin: 0, padding: '6px 10px',
+              background: 'var(--bg-base)', border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-md)', fontSize: 12, color: 'var(--text-primary)',
+              fontFamily: 'ui-monospace, Consolas, monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+            }}>{pendingAskUser.command}</pre>
+          )}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {pendingAskUser.kind === 'install' ? (
+              <>
+                <button
+                  onClick={() => { const id = pendingAskUser.sessionId ?? activeSessionId; const cmd = askUserGuidance.trim() || pendingAskUser.command; setAskUserGuidance(''); void resumeSession(id, 'approve', undefined, cmd); }}
+                  style={{ padding: '5px 12px', fontSize: 11, fontWeight: 700, background: 'var(--green, #22c55e)', color: '#04210f', border: 'none', borderRadius: 'var(--radius-md)', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  {askUserGuidance.trim() ? 'Approve edited command' : 'Approve & let agent run'}
+                </button>
+                <button
+                  onClick={() => { const id = pendingAskUser.sessionId ?? activeSessionId; const cmd = askUserGuidance.trim() || pendingAskUser.command; setAskUserGuidance(''); setAutopilotInstalls(true); void resumeSession(id, 'approve_all', undefined, cmd); }}
+                  title="Approve this install AND all future installs in this run — no more prompts."
+                  style={{ padding: '5px 12px', fontSize: 11, fontWeight: 700, background: 'var(--accent, #6366f1)', color: '#fff', border: 'none', borderRadius: 'var(--radius-md)', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  Allow all installs
+                </button>
+                <button
+                  onClick={() => { const id = pendingAskUser.sessionId ?? activeSessionId; const reason = askUserGuidance.trim() || undefined; setAskUserGuidance(''); void resumeSession(id, 'deny', reason); }}
+                  style={{ padding: '5px 12px', fontSize: 11, fontWeight: 700, background: 'var(--red, #ef4444)', color: '#fff', border: 'none', borderRadius: 'var(--radius-md)', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >
+                  Deny
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => { const id = pendingAskUser.sessionId ?? activeSessionId; const msg = askUserGuidance.trim() || undefined; setAskUserGuidance(''); void resumeSession(id, 'guidance', msg); }}
+                style={{ padding: '5px 12px', fontSize: 11, fontWeight: 700, background: 'var(--accent, #6366f1)', color: '#fff', border: 'none', borderRadius: 'var(--radius-md)', cursor: 'pointer', whiteSpace: 'nowrap' }}
+              >
+                Send guidance
+              </button>
+            )}
+            <input
+              value={askUserGuidance}
+              onChange={(e) => setAskUserGuidance(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && pendingAskUser) { const id = pendingAskUser.sessionId ?? activeSessionId; const v = askUserGuidance.trim(); if (!v) return; setAskUserGuidance(''); void resumeSession(id, pendingAskUser.kind === 'install' ? 'approve' : 'guidance', pendingAskUser.kind === 'install' ? undefined : v, pendingAskUser.kind === 'install' ? v : undefined); } }}
+              placeholder={pendingAskUser.kind === 'install' ? 'Optional: type a corrected command, then Approve — or a deny reason' : 'Type instructions for the agent, then press Enter'}
+              style={{ flex: 1, minWidth: 200, padding: '5px 9px', fontSize: 12, background: 'var(--bg-base)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)' }}
+            />
+            <button
+              onClick={() => { const id = pendingAskUser.sessionId ?? activeSessionId; setAskUserGuidance(''); clearPendingAskUser(); void stop(id); }}
+              style={{ padding: '5px 12px', fontSize: 11, fontWeight: 600, background: 'transparent', color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', cursor: 'pointer', whiteSpace: 'nowrap' }}
+            >
+              Stop
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Main Body ── */}
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minHeight: 0 }}>
@@ -484,11 +678,11 @@ export default function App() {
         }}>
           {sidebarOpen && (
             <aside style={{
-              width: 230,
+              width: sidebarWidth,
           display: 'flex',
           flexDirection: 'column',
           flexShrink: 0,
-          borderRight: '1px solid var(--border)',
+          borderRight: 'none',
           background: 'var(--bg-surface)',
           overflow: 'hidden',
         }}>
@@ -643,8 +837,65 @@ export default function App() {
                     />
                   </span>
                 </label>
+                <label
+                  className="flex items-center justify-between"
+                  style={{
+                    fontSize: 12,
+                    color: 'var(--text-secondary)',
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                  }}
+                  onClick={() => setAutopilotInstalls((prev) => !prev)}
+                  title="When on, the agent runs install commands (npm/pip/winget…) without asking each time. Opt in at session start; stays on for the rest of the session."
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ fontSize: 13 }}>{autopilotInstalls ? '🚀' : '🛑'}</span>
+                    <span>Autopilot installs</span>
+                  </span>
+                  <span
+                    style={{
+                      width: 30,
+                      height: 16,
+                      borderRadius: 10,
+                      background: autopilotInstalls ? 'var(--accent)' : 'var(--bg-card)',
+                      border: '1px solid var(--border)',
+                      position: 'relative',
+                      transition: 'background 0.2s',
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span
+                      style={{
+                        position: 'absolute',
+                        top: 1,
+                        left: autopilotInstalls ? 14 : 1,
+                        width: 12,
+                        height: 12,
+                        borderRadius: '50%',
+                        background: autopilotInstalls ? 'var(--bg-surface)' : 'var(--text-muted)',
+                        transition: 'left 0.2s, background 0.2s',
+                      }}
+                    />
+                  </span>
+                </label>
               </div>
             </aside>
+          )}
+
+          {/* Drag handle — resize sidebar width */}
+          {sidebarOpen && (
+            <div
+              className={`panel-drag-handle${isDragging && dragRef.current?.target === 'sidebar' ? ' dragging' : ''}`}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                document.body.style.cursor = 'col-resize';
+                document.body.style.userSelect = 'none';
+                dragRef.current = { target: 'sidebar', startX: e.clientX, startWidth: sidebarWidth };
+                setIsDragging(true);
+              }}
+              style={{ borderRight: '1px solid var(--border)' }}
+              title="Drag to resize sidebar"
+            />
           )}
 
           {/* Collapse switch — right edge of sidebar */}
@@ -682,11 +933,12 @@ export default function App() {
           {/* Main Area: Chat Panel (Always Visible) */}
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
             <ChatPanel
-              model={model}
+              model={activeModel}
               sessionId={activeSessionId}
               messages={messages}
               status={status}
               sendMessage={sendMessage}
+              rerunFrom={rerunFrom}
               stop={stop}
               killModel={killModel}
               resetSession={resetSession}
@@ -695,7 +947,10 @@ export default function App() {
               thinkingMode={thinkingMode}
               numThread={numThread}
               inferenceBackend={inferenceBackend}
+              cloudProvider={activeCloudProvider}
               cavemanMode={cavemanMode}
+              autopilotInstalls={autopilotInstalls}
+              visionSupported={Boolean(modelMap?.models?.find((m: any) => m.id === activeModel)?.capabilities?.vision)}
               sidebarOpen={true}
               rightPanelOpen={true}
               hasNovelOutline={novelOutlineReady}
@@ -703,10 +958,10 @@ export default function App() {
                 if (!novelFirstChapter) return;
                 sendMessage(
                   `[NOVEL_DRAFT:${activeSessionId}:${novelFirstChapter.number}]`,
-                  model,
+                  activeModel,
                   activeSessionId,
                   'novelist',
-                  { isolated: true, numCtx: contextSize, think: thinkingMode, numThread, inferenceBackend, caveman: false }
+                  { isolated: true, numCtx: contextSize, think: thinkingMode, numThread, inferenceBackend, caveman: false, autopilotInstalls, cloudProvider: activeCloudProvider }
                 );
               }}
               onToggleSidebar={() => setSidebarOpen((o) => !o)}
@@ -747,14 +1002,29 @@ export default function App() {
               <span style={{ fontSize: 11, lineHeight: 1 }}>⊞</span>
             </button>
 
+            {/* Drag handle — resize right panel width */}
+            {rightPanelOpen && (
+              <div
+                className={`panel-drag-handle${isDragging && dragRef.current?.target === 'right' ? ' dragging' : ''}`}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  document.body.style.cursor = 'col-resize';
+                  document.body.style.userSelect = 'none';
+                  dragRef.current = { target: 'right', startX: e.clientX, startWidth: rightPanelWidth };
+                  setIsDragging(true);
+                }}
+                style={{ borderLeft: '1px solid var(--border)' }}
+                title="Drag to resize tools panel"
+              />
+            )}
+
             <div style={{
               display: rightPanelOpen ? 'flex' : 'none',
-              width: '50vw',
-              minWidth: 400,
+              width: rightPanelWidth,
               flexDirection: 'column',
               overflow: 'hidden',
               background: 'var(--bg-surface)',
-              borderLeft: '1px solid var(--border)',
+              borderLeft: 'none',
             }}>
                 {/* Tab headers */}
                 <div style={{
@@ -819,23 +1089,23 @@ export default function App() {
                   }}>
                     <NovelStudio
                       sessionId={activeSessionId}
-                      modelId={model}
+                      modelId={activeModel}
                       thinkingMode={thinkingMode}
                       contextSize={contextSize}
                       isRunning={isRunning}
                       stop={stop}
-                      killModel={killModel}
-                      inferenceBackend={inferenceBackend}
+                      killModel={cloudMode ? undefined : killModel}
+                      inferenceBackend={cloudMode ? undefined : inferenceBackend}
                       onCreateNovelSession={createNovelChat}
                       onActivateNovelSession={activateNovelChat}
                       onOutlineReady={handleNovelOutlineReady}
                       onDraftChapter={(novelId, chapterNum, chapterTitle) => {
                         sendMessage(
                           `[NOVEL_DRAFT:${novelId}:${chapterNum}]`,
-                          model,
+                          activeModel,
                           activeSessionId,
                           'novelist',
-                          { isolated: true, numCtx: contextSize, think: thinkingMode, numThread, inferenceBackend, caveman: false }
+                          { isolated: true, numCtx: contextSize, think: thinkingMode, numThread, inferenceBackend, caveman: false, autopilotInstalls, cloudProvider: activeCloudProvider }
                         );
                       }}
                     />
@@ -861,11 +1131,23 @@ export default function App() {
       }}>
         <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
           <span className="dot dot-green" style={{ width: 5, height: 5 }} />
-          Ollama Agent UI v1.0
+          {cloudMode ? 'Cloud Agent UI v1.0' : 'Ollama Agent UI v1.0'}
         </span>
         <span>workspace: agent-workspace/</span>
+        {cloudMode && <span>{cloudSettings.provider}</span>}
         {selectedFile && <span>editing: {selectedFile}</span>}
       </footer>
+
+      <CloudProviderModal
+        open={cloudModalOpen}
+        disabled={isRunning}
+        settings={cloudSettings}
+        onSave={(next) => {
+          setCloudSettings(next);
+          setCloudMode(true);
+        }}
+        onClose={() => setCloudModalOpen(false)}
+      />
     </div>
   );
 }

@@ -77,6 +77,15 @@ async function fetchNovel(sessionId: string): Promise<NovelWithDetails | null> {
   return res.json();
 }
 
+async function saveBible(id: string, bible: NovelBible): Promise<void> {
+  const res = await fetch(`/api/novels/${id}/bible`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(bible),
+  });
+  if (!res.ok) throw new Error('Failed to save character bible.');
+}
+
 interface PastCharacter {
   name: string;
   description: string;

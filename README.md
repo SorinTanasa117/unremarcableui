@@ -168,4 +168,27 @@ $env:BRAVE_SEARCH_API_KEY="your-brave-search-api-key"
 # Or place BRAVE_SEARCH_API_KEY=... in .env
 ```
 
+### Cloud providers
+
+Open the **Cloud** control in the top bar to configure OpenRouter or Factory.ai
+with an API key and model ID. The browser stores the selected provider, key,
+and model in `localStorage`; the key is sent in the request body only when a
+cloud chat request or model-list request is made. Use the **Test connection**
+button to validate the key and load the provider's live `/models` list.
+
+Optional server-side defaults:
+
+```dotenv
+OPENROUTER_API_KEY=
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+FACTORY_API_KEY=
+FACTORY_OPENAI_BASE_URL=https://api.factory.ai/v1
+```
+
+`FACTORY_OPENAI_BASE_URL` is useful for a Factory deployment or compatible
+gateway that exposes OpenAI-compatible `/v1/models` and
+`/v1/chat/completions` endpoints. Factory's public documentation describes
+BYOK custom-model configuration rather than a universal hosted inference
+endpoint, so use the base URL supplied by your Factory deployment.
+
 The application UI will be available at **`http://localhost:5174`** (Client) and proxy requests to the backend API.
