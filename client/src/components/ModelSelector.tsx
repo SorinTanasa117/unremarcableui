@@ -103,9 +103,15 @@ export function ModelSelector({ value, onChange, disabled, persona, backend }: P
   const displayModels = persona === 'creative'
     ? models
     : filteredModels;
+  // Alphabetical by displayed label so the dropdown reads predictably.
+  const sortedDisplayModels = [...displayModels].sort((a, b) => {
+    const nameA = a.display_name ?? a.name;
+    const nameB = b.display_name ?? b.name;
+    return nameA.localeCompare(nameB, undefined, { sensitivity: 'base', numeric: true });
+  });
   const selectableModels = backend === 'llamacpp'
-    ? displayModels.filter((m) => m.sycl_available !== false)
-    : displayModels;
+    ? sortedDisplayModels.filter((m) => m.sycl_available !== false)
+    : sortedDisplayModels;
 
   // Sync selected model: if active model is not in the list of displayModels, 
   // auto-select the first available one to avoid invalid selection.
@@ -164,7 +170,7 @@ export function ModelSelector({ value, onChange, disabled, persona, backend }: P
         {displayModels.length === 0 && !isLoading && !isError && (
           <option value="">No models found</option>
         )}
-        {displayModels.map((m) => {
+        {sortedDisplayModels.map((m) => {
           const mapDef = modelMap.find((item) => item.id === (m.map_id ?? m.name));
           const unavailableInSycl = backend === 'llamacpp' && m.sycl_available === false;
           const isModelLoaded = m.is_loaded || loadedModels.some((lm) => lm.name === m.name || (lm.model && lm.model.startsWith(m.name)));
