@@ -218,7 +218,7 @@
             "max_context": 128000,
             "quantization": "none",
             "capabilities": {
-                "vision": false,
+                "vision": true,
                 "function_calling": true,
                 "thinking_mode": true,
                 "uncensored": false
@@ -229,15 +229,34 @@
             },
             "system_prompt_type": "chatml",
             "recommended_use": "Always-on agent execution, high-volume tool calls, long-running autonomous workflows"
-        },
+        }, 
         {
-            "id": "gemma4:26b-uncensored",
+            "id": "gemma4:26b",
             "name": "Gemma 4 26B Vision (MoE)",
-            "size_gb": 16.0,
+            "size_gb": 17.0,
             "max_context": 262144,
             "quantization": "Q4_K_M",
             "capabilities": {
                 "vision": true,
+                "function_calling": true,
+                "thinking_mode": true,
+                "uncensored": true
+            },
+            "thinking_config": {
+                "tag": "think",
+                "default_enabled": true
+            },
+            "system_prompt_type": "gemma",
+            "recommended_use": "Multimodal image understanding, visual coding, uncensored complex tasks"
+        },
+        {
+            "id": "gemma4:26b-uncensored",
+            "name": "Gemma 4 26B Uncen (MoE)",
+            "size_gb": 16.0,
+            "max_context": 262144,
+            "quantization": "Q4_K_M",
+            "capabilities": {
+                "vision": false,
                 "function_calling": true,
                 "thinking_mode": true,
                 "uncensored": true

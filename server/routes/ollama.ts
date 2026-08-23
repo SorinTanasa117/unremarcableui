@@ -72,6 +72,47 @@ const CONTEXT_SIZES = new Set([16_384, 32_768, 65_536, 131_072, 262_144]);
 // guidance (ask_user), 5 in a row kills the run for human review. Any success
 // resets the consecutive-failure counter.
 const MAX_CONSECUTIVE_FAILURES = 5;
+
+// ── Run watchdog (local runtimes) ──────────────────────────────────────────
+// Kills runs that are provably dead instead of letting them hold VRAM forever,
+// while NEVER cutting a model that is genuinely working slowly. Evidence model:
+//   • any streamed token/thinking chunk  → decoding, alive
+//   • llama.cpp /slots n_past advancing  → prompt-eval/decode progressing
+//   • CPU burned by ollama*/llama-server → compute happening (prefill, paging)
+// Termination rules (all env-tunable):
+//   • whole run exceeds RUN_MAX_DURATION_MS          → cut (default 6h)
+//   • ONE inference turn exceeds TURN_MAX_DURATION_MS → cut (default 1h)
+//   • ONE tool call exceeds TOOL_MAX_DURATION_MS      → failed result (default 1h)
+//   • response streaming but TWO consecutive probes find no tokens AND no
+//     compute → proven hang, cut instantly. Inconclusive probes resolve to
+//     "alive" — never kill blind.
+const WATCHDOG_ENABLED = process.env.RUN_WATCHDOG !== 'false';
+const parsedRunMaxMs = Number.parseInt(process.env.RUN_MAX_DURATION_MS ?? '21600000', 10);
+const RUN_MAX_DURATION_MS = Number.isFinite(parsedRunMaxMs) && parsedRunMaxMs > 0 ? parsedRunMaxMs : 21_600_000;
+const parsedTurnMaxMs = Number.parseInt(process.env.TURN_MAX_DURATION_MS ?? '3600000', 10);
+const TURN_MAX_DURATION_MS = Number.isFinite(parsedTurnMaxMs) && parsedTurnMaxMs > 0 ? parsedTurnMaxMs : 3_600_000;
+const parsedToolMaxMs = Number.parseInt(process.env.TOOL_MAX_DURATION_MS ?? '3600000', 10);
+const TOOL_MAX_DURATION_MS = Number.isFinite(parsedToolMaxMs) && parsedToolMaxMs > 0 ? parsedToolMaxMs : 3_600_000;
+// Long prefills on slow backends (iGPU/Vulkan, ~9 tok/s over an 8k+ prompt)
+// stream zero tokens for many minutes while healthy. 120s false-killed those
+// runs; 30 minutes of proven silence is the kill threshold instead.
+const parsedStallQuietMs = Number.parseInt(process.env.STALL_QUIET_MS ?? '1800000', 10);
+const STALL_QUIET_MS = Number.isFinite(parsedStallQuietMs) && parsedStallQuietMs > 0 ? parsedStallQuietMs : 1_800_000;
+const parsedProbeIntervalMs = Number.parseInt(process.env.WATCHDOG_PROBE_INTERVAL_MS ?? '15000', 10);
+const WATCHDOG_PROBE_INTERVAL_MS = Number.isFinite(parsedProbeIntervalMs) && parsedProbeIntervalMs > 0 ? parsedProbeIntervalMs : 15_000;
+const parsedProbeGapMs = Number.parseInt(process.env.WATCHDOG_PROBE_SAMPLE_GAP_MS ?? '3000', 10);
+const WATCHDOG_PROBE_SAMPLE_GAP_MS = Number.isFinite(parsedProbeGapMs) && parsedProbeGapMs > 0 ? parsedProbeGapMs : 3_000;
+const parsedMinCpu = Number.parseFloat(process.env.WATCHDOG_MIN_CPU_TICKS_PER_SEC ?? '500000');
+// Cumulative kernel+user CPU ticks (100ns units) burned per second by the
+// runtime's processes. 500k ticks/s = 50ms of CPU per second ≈ 5% of one core.
+// Below this during silence, the runtime is not working.
+const WATCHDOG_MIN_CPU_TICKS_PER_SEC = Number.isFinite(parsedMinCpu) && parsedMinCpu >= 0 ? parsedMinCpu : 500_000;
+const parsedIdleProbes = Number.parseInt(process.env.WATCHDOG_IDLE_PROBES_TO_KILL ?? '20', 10);
+// 20 probes × 15s interval ≈ 5 minutes of consecutive conclusive-zero
+// evidence before a hang verdict. A single bad CPU sample (iGPU offload,
+// counter hiccup) can no longer kill a healthy run.
+const WATCHDOG_IDLE_PROBES_TO_KILL = Number.isFinite(parsedIdleProbes) && parsedIdleProbes > 0 ? parsedIdleProbes : 20;
+
 const SESSIONS_DIR = path.resolve(WORKSPACE_DIR, '.sessions');
 const OLLAMA_FAILURE_LOG_PATH = path.resolve(WORKSPACE_DIR, '.logs', 'ollama-failures.jsonl');
 const MAX_OLLAMA_FAILURE_LOG_BYTES = 512 * 1024;
@@ -130,6 +171,102 @@ let ollamaDigestNameMapPromise: Promise<Map<string, string>> | null = null;
 const unsupportedLlamaCppArchByDigest = new Map<string, string>();
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ── Runtime health probes (watchdog evidence) ──────────────────────────────
+
+interface CpuProbe {
+  ticks: number; // cumulative kernel+user CPU, 100ns units (Get-Counter native)
+  processes: number;
+}
+
+/** Sample cumulative CPU ticks of ollama/llama-server runner processes via
+ *  Get-Counter. Returns null when the counter or processes are unavailable —
+ *  an inconclusive probe must never count as evidence of a hang. */
+async function probeRuntimeCpuTicks(backend: InferenceBackend): Promise<CpuProbe | null> {
+  // llama.cpp on SYCL still names its executable llama-server; Ollama runners
+  // surface as ollama*. Include the generic llama* pattern for custom builds.
+  const pattern = backend === 'llamacpp' ? 'llama*' : 'ollama*';
+  const script = `(Get-Counter '\\Process(${pattern})\\% Processor Time' -ErrorAction Stop).CounterSamples | ` +
+    `ForEach-Object { [pscustomobject]@{ name = $_.InstanceName; pct = $_.CookedValue } } | ConvertTo-Json -Compress`;
+  try {
+    const result = await runCommandCapture('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
+    if (result.code !== 0 || !result.stdout.trim()) return null;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(result.stdout.trim());
+    } catch {
+      return null;
+    }
+    const samples = Array.isArray(parsed) ? parsed : [parsed];
+    let totalPercent = 0;
+    for (const sample of samples) {
+      const value = Number(sample?.pct);
+      if (Number.isFinite(value)) totalPercent += value;
+    }
+    // % Processor Time is per-core-normalized by Get-Processor-Time semantics:
+    // CookedValue is already a percentage where 100 = one full core.
+    const cpuSecondsPerSecond = totalPercent / 100;
+    return { ticks: Math.round(cpuSecondsPerSecond * 10_000_000), processes: samples.length };
+  } catch {
+    return null;
+  }
+}
+
+/** Read llama.cpp slot progress. n_past advances while prompt-eval/decode runs,
+ *  giving exact liveness evidence with no CPU sampling required. */
+async function probeLlamaCppSlotProgress(): Promise<number | null> {
+  try {
+    const response = await fetch(`${LLAMACPP_URL}/slots`, {
+      signal: AbortSignal.timeout(3_000),
+      dispatcher: inferenceDispatcher,
+    });
+    if (!response.ok) return null;
+    const payload = await response.json() as any;
+    const slots = Array.isArray(payload) ? payload : [];
+    let nPast = 0;
+    for (const slot of slots) {
+      const value = Number(slot?.prompt_progress?.n_past);
+      if (Number.isFinite(value)) nPast += value;
+    }
+    return slots.length > 0 ? nPast : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decide whether a quiet runtime is actually computing. Combines both probes:
+ * llama.cpp slot progress when available, otherwise CPU sampling. Any positive
+ * signal means "alive"; only conclusive zeros count toward a hang verdict.
+ */
+async function probeRuntimeComputing(
+  backend: InferenceBackend,
+  previousCpuTicks: number | null,
+  previousNPast: number | null,
+): Promise<{ computing: boolean; cpuTicks: CpuProbe | null; nPast: number | null }> {
+  if (backend === 'llamacpp') {
+    const nPast = await probeLlamaCppSlotProgress();
+    if (nPast !== null && previousNPast !== null && nPast > previousNPast) {
+      return { computing: true, cpuTicks: null, nPast };
+    }
+    // Slot data unavailable or frozen — fall back to CPU evidence so a missing
+    // /slots endpoint cannot mask real compute (or fabricate one).
+    const cpuTicks = await probeRuntimeCpuTicks(backend);
+    const computing = nPast === null
+      ? (cpuTicks !== null && previousCpuTicks !== null && cpuTicks.ticks - previousCpuTicks >= WATCHDOG_MIN_CPU_TICKS_PER_SEC * (WATCHDOG_PROBE_SAMPLE_GAP_MS / 1000))
+      : false;
+    return { computing, cpuTicks, nPast };
+  }
+
+  const cpuTicks = await probeRuntimeCpuTicks(backend);
+  if (cpuTicks === null || previousCpuTicks === null) {
+    return { computing: false, cpuTicks, nPast: null }; // inconclusive → not evidence
+  }
+  const deltaTicks = cpuTicks.ticks - previousCpuTicks;
+  const minTicks = WATCHDOG_MIN_CPU_TICKS_PER_SEC * (WATCHDOG_PROBE_SAMPLE_GAP_MS / 1000);
+  return { computing: deltaTicks >= minTicks, cpuTicks, nPast: null };
+}
+
 
 async function runCommandCapture(command: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
@@ -1411,8 +1548,15 @@ export async function getPersonaPrompt(personaKey: string): Promise<string> {
   }
 }
 
-export async function getCtx(sessionId: string, fallbackPersona: string = 'coder'): Promise<{ ctx: ContextManager; persona: string; model: string }> {
-  if (sessions.has(sessionId)) {
+export async function getCtx(
+  sessionId: string,
+  fallbackPersona: string = 'coder',
+  opts: { preferDisk?: boolean } = {},
+): Promise<{ ctx: ContextManager; persona: string; model: string }> {
+  // preferDisk bypasses the in-memory cache so readers (session history UI)
+  // see the on-disk transcript even if a stale empty context was cached by
+  // the brand-new-session race below. Active runs keep using their cache.
+  if (sessions.has(sessionId) && !opts.preferDisk) {
     let currentPersona = fallbackPersona;
     let currentModel = '';
     let hasSavedSession = false;
@@ -1735,15 +1879,22 @@ router.get('/session', async (req: Request, res: Response) => {
   const sessionId = req.query.sessionId as string;
   if (!sessionId) { res.status(400).json({ error: 'Missing sessionId' }); return; }
   try {
-    const { ctx, persona, model } = await getCtx(sessionId);
-    if (persona === 'researcher') {
-      const sessionLedgerPath = path.join(SESSIONS_DIR, `${sessionId}-ledger.json`);
-      const activeLedgerPath = path.resolve(WORKSPACE_DIR, 'research-ledger.json');
-      try {
-        const content = await fs.readFile(sessionLedgerPath, 'utf-8');
-        await fs.writeFile(activeLedgerPath, content, 'utf-8');
-      } catch {
-        await fs.rm(activeLedgerPath, { force: true });
+    // While a run is active, serve the live in-memory context. Otherwise
+    // prefer disk so a stale cached empty context can never hide history.
+    const liveRun = activeRuns.get(sessionId);
+    const { ctx, persona, model } = await getCtx(sessionId, 'coder', {
+      preferDisk: !liveRun,
+    });
+    if (liveRun) {
+      if (persona === 'researcher') {
+        const sessionLedgerPath = path.join(SESSIONS_DIR, `${sessionId}-ledger.json`);
+        const activeLedgerPath = path.resolve(WORKSPACE_DIR, 'research-ledger.json');
+        try {
+          const content = await fs.readFile(sessionLedgerPath, 'utf-8');
+          await fs.writeFile(activeLedgerPath, content, 'utf-8');
+        } catch {
+          await fs.rm(activeLedgerPath, { force: true });
+        }
       }
     }
     res.json({ messages: ctx.getMessages(), persona, model, run: activeRuns.get(sessionId) });
@@ -2295,6 +2446,10 @@ router.post('/chat', async (req: Request, res: Response) => {
         resumeDeferred.delete(sessionId);
         const r = activeRuns.get(sessionId);
         if (r) { r.pausedAskUser = undefined; r.updatedAt = Date.now(); }
+        // A user decision ends a legitimate quiet period; reset the watchdog's
+        // stall clock so post-resume inference gets a full quiet window.
+        lastStreamActivityAtMs = Date.now();
+        consecutiveIdleProbes = 0;
         resolve(decision);
       };
       const onAbort = () => finish(null);
@@ -2317,6 +2472,112 @@ router.post('/chat', async (req: Request, res: Response) => {
   });
 
   let lastProgressSavedAt = 0;
+  // ── Watchdog state (local runtimes only) ──────────────────────────────
+  // Budgets: whole run ≤ RUN_MAX_DURATION_MS, each inference turn ≤
+  // TURN_MAX_DURATION_MS, each tool call ≤ TOOL_MAX_DURATION_MS, plus instant
+  // cut of a PROVEN hang. A hang requires: the response stream is open and has
+  // been silent > STALL_QUIET_MS, and two consecutive health probes found no
+  // tokens AND no compute. Anything inconclusive counts as alive.
+  const watchdogEnabled = WATCHDOG_ENABLED && !isolated;
+  const runStartedAtMs = Date.now();
+  let turnStartedAtMs = Date.now();
+  let lastStreamActivityAtMs = Date.now();
+  let lastProbeCpuTicks: number | null = null;
+  let lastProbeNPast: number | null = null;
+  let consecutiveIdleProbes = 0;
+  let quietStatusSentAt = 0;
+  const noteStreamActivity = () => {
+    lastStreamActivityAtMs = Date.now();
+    consecutiveIdleProbes = 0;
+  };
+  let watchdogTimer: ReturnType<typeof setInterval> | undefined;
+  const stopWatchdog = () => {
+    if (watchdogTimer) {
+      clearInterval(watchdogTimer);
+      watchdogTimer = undefined;
+    }
+  };
+  let terminalSentWatchdog = false;
+  // Main-loop gate, declared here so the watchdog interval can observe it.
+  let iterating = true;
+  const killRun = async (reason: string) => {
+    stopWatchdog();
+    terminalSentWatchdog = true;
+    console.warn(`[watchdog] session=${sessionId} killing run: ${reason}`);
+    send('killed', { reason });
+    ac.abort();
+  };
+
+  if (watchdogEnabled) {
+    watchdogTimer = setInterval(() => {
+      void (async () => {
+        try {
+          if (ac.signal.aborted || !iterating) { stopWatchdog(); return; }
+          const run = activeRuns.get(sessionId);
+          const runStatus = run?.status ?? 'thinking';
+          const now = Date.now();
+
+          // Budget 1 — whole-run wall clock.
+          if (now - runStartedAtMs >= RUN_MAX_DURATION_MS) {
+            await killRun(`run exceeded its ${Math.round(RUN_MAX_DURATION_MS / 60_000)}-minute total budget`);
+            return;
+          }
+
+          // Pauses waiting for user approval are heartbeated by pauseForUser
+          // and have no runtime involvement; skip stall evaluation entirely.
+          if (runStatus === 'paused') return;
+
+          // While a tool runs there is no model stream to monitor; the tool's
+          // own Promise.race cap enforces TOOL_MAX_DURATION_MS instead.
+          if (runStatus === 'tool') return;
+
+          // Budget 2 — single inference turn wall clock.
+          if (now - turnStartedAtMs >= TURN_MAX_DURATION_MS) {
+            await killRun(`a single generation turn exceeded ${Math.round(TURN_MAX_DURATION_MS / 60_000)} minutes`);
+            return;
+          }
+
+          // Stall evidence window.
+          const quietMs = now - lastStreamActivityAtMs;
+          if (quietMs < STALL_QUIET_MS) {
+            if (consecutiveIdleProbes > 0) consecutiveIdleProbes = 0;
+            return;
+          }
+          // Surface the quiet state so the UI shows why probing is happening.
+          if (now - quietStatusSentAt >= 30_000) {
+            quietStatusSentAt = now;
+            send('status', { message: `Quiet ${Math.round(quietMs / 1000)}s — verifying runtime health…` });
+          }
+
+          const probe = await probeRuntimeComputing(backend, lastProbeCpuTicks, lastProbeNPast);
+          const hadPriorCpuSample = lastProbeCpuTicks !== null;
+          lastProbeCpuTicks = probe.cpuTicks?.ticks ?? null;
+          lastProbeNPast = probe.nPast;
+
+          if (probe.computing) {
+            consecutiveIdleProbes = 0;
+            return;
+          }
+
+          // Inconclusive rounds (probe failed / no prior sample to diff) are
+          // never evidence of a hang — wait for the next tick.
+          if (probe.cpuTicks === null && probe.nPast === null) return;
+          if (probe.nPast === null && !hadPriorCpuSample) return;
+
+          consecutiveIdleProbes += 1;
+          console.warn(`[watchdog] session=${sessionId} idle probe ${consecutiveIdleProbes}/${WATCHDOG_IDLE_PROBES_TO_KILL} quiet=${Math.round(quietMs / 1000)}s`);
+          if (consecutiveIdleProbes >= WATCHDOG_IDLE_PROBES_TO_KILL) {
+            await killRun(`runtime confirmed hung — no tokens and no compute for ~${Math.round((STALL_QUIET_MS + WATCHDOG_IDLE_PROBES_TO_KILL * WATCHDOG_PROBE_INTERVAL_MS) / 60_000)} min`);
+          }
+        } catch (error) {
+          console.warn('[watchdog] tick failed:', error);
+        }
+      })();
+    }, WATCHDOG_PROBE_INTERVAL_MS);
+    if (typeof watchdogTimer === 'object' && watchdogTimer !== null && 'unref' in watchdogTimer) {
+      (watchdogTimer as any).unref?.();
+    }
+  }
   let toolCallCount = 0;
   let toolFailureCount = 0;
   let searchFailureCount = 0;
@@ -2389,7 +2650,7 @@ router.post('/chat', async (req: Request, res: Response) => {
   let pendingPartialContent = '';
 
   try {
-    let iterating = true;
+    // `iterating` is declared above (watchdog scope) and initialized true.
     // When research tools become unavailable, make one final model pass with
     // tools disabled so it can write a candid partial report from successful
     // results already in the conversation.
@@ -2401,6 +2662,9 @@ router.post('/chat', async (req: Request, res: Response) => {
     let terminalSent = false;
     while (iterating && !ac.signal.aborted) {
       iterationNumber += 1;
+      turnStartedAtMs = Date.now();
+      lastStreamActivityAtMs = Date.now();
+      consecutiveIdleProbes = 0;
       pendingPartialContent = '';
       const capabilities = await getModelCapabilities(model, ac.signal, backend);
       const activeContext = activeContextSize;
@@ -2610,6 +2874,7 @@ router.post('/chat', async (req: Request, res: Response) => {
 
             if (msg.thinking) {
               markGenerationStarted();
+              noteStreamActivity();
               visibleContent.markNativeThinkingSeen();
               appendThinking(msg.thinking);
               // A pure-<think> stretch emits no visible content, so without a
@@ -2626,6 +2891,7 @@ router.post('/chat', async (req: Request, res: Response) => {
 
             if (msg.content) {
               markGenerationStarted();
+              noteStreamActivity();
               const content = visibleContent(msg.content);
               if (content) {
                 assistantContent += content;
@@ -2638,6 +2904,7 @@ router.post('/chat', async (req: Request, res: Response) => {
 
             if (msg.tool_calls?.length) {
               markGenerationStarted();
+              noteStreamActivity();
               for (const tc of msg.tool_calls) {
                 pendingToolCalls.push(tc);
               }
@@ -2683,6 +2950,8 @@ router.post('/chat', async (req: Request, res: Response) => {
         const decoder = new TextDecoder();
         let buf = '';
         let rawAssistantContent = '';
+        let emittedContentChars = 0;
+        let llamaCppThinkingChars = 0;
 
         const consumeDataLine = (line: string) => {
           const trimmed = line.trim();
@@ -2698,6 +2967,10 @@ router.post('/chat', async (req: Request, res: Response) => {
             return;
           }
 
+          // Watchdog liveness: any byte of completion data counts as stream
+          // activity, even before content is extractable.
+          noteStreamActivity();
+
           const deltaContent = parsed?.choices?.[0]?.delta?.content;
           const messageContent = parsed?.choices?.[0]?.message?.content;
           const contentChunk = typeof deltaContent === 'string'
@@ -2705,9 +2978,34 @@ router.post('/chat', async (req: Request, res: Response) => {
             : typeof messageContent === 'string'
               ? messageContent
               : '';
-          if (!contentChunk) return;
-          rawAssistantContent += contentChunk;
-          pendingPartialContent = rawAssistantContent;
+          if (contentChunk) {
+            rawAssistantContent += contentChunk;
+            pendingPartialContent = rawAssistantContent;
+            markGenerationStarted();
+            // Forward the growing text live so a long single-shot generation
+            // streams into the UI instead of appearing all at once at the end.
+            if (rawAssistantContent.length > emittedContentChars) {
+              send('token', { content: rawAssistantContent.slice(emittedContentChars) });
+              emittedContentChars = rawAssistantContent.length;
+            }
+            return;
+          }
+
+          // Some builds stream reasoning in delta.reasoning_content /
+          // delta.reasoning before any visible content. Surface it through the
+          // thinking channel so the user sees progress and the watchdog sees
+          // activity instead of a silent multi-hour "ghost" run.
+          const reasoningChunk = parsed?.choices?.[0]?.delta?.reasoning_content
+            ?? parsed?.choices?.[0]?.delta?.reasoning;
+          if (typeof reasoningChunk === 'string' && reasoningChunk) {
+            markGenerationStarted();
+            // appendThinking lives in the ollama branch scope; mirror its
+            // visible behavior here without the think-budget machinery.
+            if (!caveman) send('thinking', { content: reasoningChunk });
+            llamaCppThinkingChars += reasoningChunk.length;
+            const run = activeRuns.get(sessionId);
+            if (run) run.statusText = `Reasoning… (${llamaCppThinkingChars} chars)`;
+          }
         };
 
         while (true) {
@@ -3063,12 +3361,26 @@ router.post('/chat', async (req: Request, res: Response) => {
           }
 
           const toolStartedAt = Date.now();
-          const result = toolName === 'browse_url' && !isBrowseUrlAllowed(args.url, requestCtx.getMessages())
-            ? {
-              success: false,
-              output: `Browse denied: ${args.url} was not returned by a successful search and was not supplied by the user. Do not guess URLs; use only search-result links already in the context.`,
-            }
-            : await runTool(toolName, args, sessionId);
+          // Tool-call budget: never let one tool call exceed TOOL_MAX_DURATION_MS.
+          // Promise.race only abandons the await — runTool's own timeouts
+          // (10-min terminal cap, 12–22s web caps) still terminate the real
+          // work, so this is a safety net against a wedged tool promise.
+          const toolTimeoutMs = TOOL_MAX_DURATION_MS;
+          const result = await Promise.race([
+            toolName === 'browse_url' && !isBrowseUrlAllowed(args.url, requestCtx.getMessages())
+              ? Promise.resolve({
+                success: false,
+                output: `Browse denied: ${args.url} was not returned by a successful search and was not supplied by the user. Do not guess URLs; use only search-result links already in the context.`,
+              })
+              : runTool(toolName, args, sessionId),
+            new Promise<{ success: boolean; output: string }>((resolve) => setTimeout(
+              () => resolve({
+                success: false,
+                output: `[watchdog] Tool call exceeded its ${Math.round(TOOL_MAX_DURATION_MS / 60_000)}-minute budget and was abandoned. Treat this as a failure and continue with a different approach.`,
+              }),
+              toolTimeoutMs,
+            )),
+          ]);
           const toolDurationMs = Date.now() - toolStartedAt;
           toolCallCount += 1;
           if (!result.success) {
@@ -3135,8 +3447,12 @@ router.post('/chat', async (req: Request, res: Response) => {
     }
 
     if (ac.signal.aborted) {
-      send('stopped', {});
-      terminalSent = true;
+      // The watchdog's killRun already emitted 'killed'; don't double-send a
+      // terminal event (the client treats the first as final).
+      if (!terminalSentWatchdog) {
+        send('stopped', {});
+        terminalSent = true;
+      }
     } else if (!terminalSent) {
       // Any non-abort exit that did not already emit 'done' (e.g. forced-final
       // -response retry exhaustion) must still send one, or the client stream
@@ -3146,7 +3462,10 @@ router.post('/chat', async (req: Request, res: Response) => {
       terminalSent = true;
     }
   } catch (err: any) {
-    if (err.name !== 'AbortError') {
+    if (terminalSentWatchdog) {
+      // Watchdog already emitted the terminal 'killed' event; suppress the
+      // AbortError fallthrough so the client sees exactly one ending.
+    } else if (err.name !== 'AbortError') {
       // Preserve any partial assistant text so the model can resume where it
       // left off when the user sends the next message (e.g. after restarting
       // a crashed Ollama). Without this the model has no memory of its
@@ -3180,6 +3499,7 @@ router.post('/chat', async (req: Request, res: Response) => {
       send('stopped', {});
     }
   } finally {
+    stopWatchdog();
     abortControllers.delete(sessionId);
     activeRuns.delete(sessionId);
     // If the run was aborted while paused for approval, release the deferred
