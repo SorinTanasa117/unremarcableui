@@ -526,7 +526,12 @@ export default function App() {
               </span>
             </div>
           </div>
-          <ProgressBar input={tokenUsage.input} output={tokenUsage.output} />
+          <ProgressBar
+            input={tokenUsage.input}
+            output={tokenUsage.output}
+            contextUsed={tokenUsage.contextUsed}
+            contextLimit={tokenUsage.contextLimit ?? contextSize}
+          />
         </div>
       </header>
 
@@ -951,6 +956,7 @@ export default function App() {
               cavemanMode={cavemanMode}
               autopilotInstalls={autopilotInstalls}
               visionSupported={Boolean(modelMap?.models?.find((m: any) => m.id === activeModel)?.capabilities?.vision)}
+              visionSidecarModel={typeof modelMap?.roles?.vision === 'string' ? modelMap.roles.vision : undefined}
               sidebarOpen={true}
               rightPanelOpen={true}
               hasNovelOutline={novelOutlineReady}

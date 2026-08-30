@@ -79,6 +79,8 @@ export interface TokenUsage {
   input: number;
   output: number;
   total: number;
+  contextUsed?: number;
+  contextLimit?: number;
 }
 
 export interface TokenRates {
@@ -322,7 +324,11 @@ export function useOllamaStream(): UseOllamaStreamReturn {
     // Only sample live rates for the active streaming session so a hydrated
     // history load doesn't pollute the in-flight measurement window.
     if (streamSessionId.current === sessionId) {
-      const rates = rateTrackerRef.current.record(Date.now(), usage.input, usage.output);
+      const rates = rateTrackerRef.current.record(
+        Date.now(),
+        usage.contextUsed ?? usage.input,
+        usage.output,
+      );
       if (visibleSessionRef.current === sessionId) {
         setTokenRates((current) => (
           current.read === rates.read && current.write === rates.write && current.active === rates.active
@@ -852,7 +858,13 @@ export function useOllamaStream(): UseOllamaStreamReturn {
             }
 
             case 'tokens':
-              updateSessionTokens(sessionId, { input: data.input ?? 0, output: data.output ?? 0, total: data.total ?? 0 });
+              updateSessionTokens(sessionId, {
+                input: data.input ?? 0,
+                output: data.output ?? 0,
+                total: data.total ?? 0,
+                contextUsed: data.contextUsed,
+                contextLimit: data.contextLimit,
+              });
               break;
 
             case 'ask_user': {

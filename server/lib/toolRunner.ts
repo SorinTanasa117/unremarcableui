@@ -8,6 +8,15 @@ import { WORKSPACE_DIR } from './tools.js';
 
 const execAsync = promisify(exec);
 const TERMINAL_TIMEOUT_MS = 10 * 60 * 1000; // 10 min — generous for npm installs; shorter than 30 so stalls surface faster
+// Absolute path to the real shell. `spawn('cmd.exe', …)` / `shell: 'cmd.exe'`
+// resolve the bare name against `cwd` (WORKSPACE_DIR) FIRST on Windows, so a
+// stray `agent-workspace/cmd.exe` gets executed instead of the shell and the
+// call dies with `spawn UNKNOWN`. An absolute ComSpec path removes that
+// ambiguity for good.
+const WIN_SHELL = process.env.ComSpec ?? 'C:\\Windows\\System32\\cmd.exe';
+// Files whose basename impersonates a shell/interpreter must never be created
+// inside the workspace: they hijack relative-name process resolution.
+const RESERVED_EXECUTABLE_RE = /^(?:cmd|powershell|pwsh|bash|sh|node|npm|npx|python|py)\.(?:exe|bat|cmd|ps1|com)$/i;
 // Respect public search services. This is pacing/backoff, not an attempt to
 // bypass a provider's access controls.
 const SEARCH_MIN_INTERVAL_MS = 8_000;
@@ -17,6 +26,10 @@ const FALLBACK_SWITCH_DELAY_MS = 3_000;
 const BRAVE_SEARCH_API_URL = 'https://api.search.brave.com/res/v1/web/search';
 const BRAVE_SEARCH_API_KEY = process.env.BRAVE_SEARCH_API_KEY?.trim();
 let nextSearchAt = 0;
+const OMITTED_HISTORY_CONTENT = new Set([
+  '[omitted from history; workspace file is source of truth]',
+  '[omitted from history]',
+]);
 
 export type ToolName = 'web_search' | 'browse_url' | 'write_file' | 'edit_file' | 'read_file' | 'run_terminal';
 
@@ -250,9 +263,9 @@ function splitBackgroundOperator(command: string): { background: string | null; 
 }
 
 // Launch a detached child that keeps running after this tool call returns.
-function startDetached(command: string): number | undefined {
-  const child = spawn('cmd.exe', ['/c', command], {
-    cwd: WORKSPACE_DIR,
+function startDetached(command: string, cwd: string = WORKSPACE_DIR): number | undefined {
+  const child = spawn(WIN_SHELL, ['/c', command], {
+    cwd,
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
@@ -261,9 +274,174 @@ function startDetached(command: string): number | undefined {
   return child.pid;
 }
 
+// Session-scoped registry of files this agent created with write_file. Overwrite
+// is allowed only for paths in this set (the agent's own output), never for
+// pre-existing or user-authored files.
+const sessionCreatedFiles = new Map<string, Set<string>>();
+function registerCreatedFile(sessionId: string | undefined, absPath: string) {
+  const key = sessionId ?? 'nosession';
+  let set = sessionCreatedFiles.get(key);
+  if (!set) { set = new Set(); sessionCreatedFiles.set(key, set); }
+  set.add(absPath);
+}
+function wasCreatedThisSession(sessionId: string | undefined, absPath: string): boolean {
+  return sessionCreatedFiles.get(sessionId ?? 'nosession')?.has(absPath) ?? false;
+}
+
+// Session-scoped registry of failed tool calls. A model that re-issues an
+// identical call that already failed is looping; we refuse to execute it again
+// and hand back an escalation so the consecutive-failure ladder can act.
+const sessionFailedCalls = new Map<string, Set<string>>();
+function failedCallKey(name: string, args: Record<string, unknown>): string {
+  return `${name}:${JSON.stringify(args)}`;
+}
+function recordFailedCall(sessionId: string | undefined, key: string) {
+  const sk = sessionId ?? 'nosession';
+  let set = sessionFailedCalls.get(sk);
+  if (!set) { set = new Set(); sessionFailedCalls.set(sk, set); }
+  set.add(key);
+}
+function hasFailedBefore(sessionId: string | undefined, key: string): boolean {
+  return sessionFailedCalls.get(sessionId ?? 'nosession')?.has(key) ?? false;
+}
+
+// Called on session reset so a fresh run does not inherit stale registries.
+export function clearSessionToolState(sessionId: string | undefined) {
+  const key = sessionId ?? 'nosession';
+  sessionCreatedFiles.delete(key);
+  sessionFailedCalls.delete(key);
+  for (const mapKey of Array.from(editRecoveryStates.keys())) {
+    if (mapKey.startsWith(`${key}:`)) editRecoveryStates.delete(mapKey);
+  }
+}
+
 const PROHIBITED_INSTALL_RE = /(^|&&|;|\|\|)\s*(npm\s+(?:install|i|ci|init|create)|npx\b|pnpm\s+(?:add|install|i|init|create)|yarn\s+(?:add|install|create|init)|pip3?\s+install|python\s+-m\s+pip\s+install|pipx\s+install|cargo\s+(?:add|init|new)|composer\s+(?:require|install)|dotnet\s+(?:add|new)|gem\s+install|winget\s+install|choco\s+install|scoop\s+install)\b/i;
+const TERMINAL_FILE_MUTATION_PATTERNS = [
+  /(^|(?:&&|\|\||[&;|])\s*)(?:del|erase|copy|xcopy|robocopy|move|ren|rename|replace|rm|mv|cp|truncate|touch)\b/i,
+  /\b(?:Set-Content|Add-Content|Clear-Content|Out-File|Remove-Item|Move-Item|Copy-Item|Rename-Item)\b/i,
+  /\b(?:sed\s+-i|perl\s+-pi)\b/i,
+  /\bgit\s+(?:checkout|restore|reset|clean)\b/i,
+  /\b(?:cmd(?:\.exe)?\s+\/[ck]|bash\s+-c|sh\s+-c)\s+["']?\s*(?:del|erase|copy|xcopy|robocopy|move|ren|rename|replace|rm|mv|cp|truncate|touch)\b/i,
+  /\bnode(?:\.exe)?\s+(?:-e|--eval)\b[\s\S]*\b(?:writeFile(?:Sync)?|appendFile(?:Sync)?|copyFile(?:Sync)?|cp(?:Sync)?|createWriteStream|open(?:Sync)?|unlink(?:Sync)?|rename(?:Sync)?|truncate(?:Sync)?|rm(?:Sync)?)\b/i,
+  /\bpython(?:\.exe)?\s+-c\b[\s\S]*(?:\bopen\s*\([^)]*,\s*['"][wax+]|\.\s*open\s*\(\s*['"][wax+]|\b(?:write_text|write_bytes|unlink|remove|rename|replace|rmtree|copyfile|move)\b)/i,
+  /(^|[^0-9])\d*>(?![>&])/,
+];
+
+function terminalCommandMutatesFiles(command: string): boolean {
+  return TERMINAL_FILE_MUTATION_PATTERNS.some((pattern) => pattern.test(command));
+}
+
+// ── edit_file miss ladder ───────────────────────────────────────────────────
+// Weak models death-spiral on exact-match edit failures: retry blind, flood
+// context with full-file reads, then emit malformed tool JSON. The ladder
+// gives progressively stronger recovery evidence per file:
+//   miss 1 → plain error + chunked-read guidance
+//   miss 2 → fuzzy-located exact source window
+//   miss 3+ → edit_file disabled until a bounded read
+export const READ_FILE_CHUNK_LINES = 100;
+interface EditRecoveryState {
+  misses: number;
+  locked: boolean;
+  fullOverwriteUnsafe: boolean;
+}
+const editRecoveryStates = new Map<string, EditRecoveryState>();
+
+function editMissKey(sessionId: string | undefined, target: string): string {
+  return `${sessionId ?? 'nosession'}:${target}`;
+}
+
+async function locateSimilarSnippet(sourceLines: string[], oldStr: string): Promise<{ start: number; end: number } | null> {
+  const oldLines = oldStr.replace(/\r\n/g, '\n').split('\n');
+  const anchors = oldLines
+    .map((line, index) => ({ text: line.trim(), index }))
+    .filter(({ text }) => text.length >= 6 && !/^[{}()\[\];,<>/\s]+$/.test(text))
+    .sort((a, b) => b.text.length - a.text.length);
+  if (!anchors.length) return null;
+
+  let bestIdx = -1;
+  let bestAnchorIdx = -1;
+  let bestScore = 0;
+  for (const anchor of anchors) {
+    const needle = anchor.text.toLowerCase();
+    for (let i = 0; i < sourceLines.length; i++) {
+      const hay = sourceLines[i].toLowerCase();
+      let score = 0;
+      if (hay.includes(needle)) score = needle.length;
+      else {
+        const overlapWindow = Math.min(needle.length, 24);
+        for (let len = overlapWindow; len >= 8; len -= 4) {
+          if (hay.includes(needle.slice(0, len))) { score = len; break; }
+        }
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+        bestAnchorIdx = anchor.index;
+      }
+    }
+  }
+  if (bestIdx < 0 || bestScore < 8) return null;
+  const windowSize = oldLines.length;
+  const maxStart = Math.max(0, sourceLines.length - windowSize);
+  const start = Math.min(maxStart, Math.max(0, bestIdx - bestAnchorIdx));
+  return {
+    start,
+    end: Math.min(sourceLines.length - 1, start + windowSize - 1),
+  };
+}
+
+function findNewlineInsensitiveMatches(source: string, oldStr: string): Array<{ start: number; end: number }> {
+  const normalizedOld = oldStr.replace(/\r\n/g, '\n');
+  const pattern = normalizedOld
+    .split('\n')
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('\\r?\\n');
+  const matches: Array<{ start: number; end: number }> = [];
+  const regex = new RegExp(pattern, 'g');
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(source)) !== null) {
+    matches.push({ start: match.index, end: match.index + match[0].length });
+    if (match[0].length === 0) regex.lastIndex++;
+  }
+  return matches;
+}
+
+function replacementWithMatchedLineEndings(source: string, start: number, end: number, replacement: string): string {
+  const matchedEol = source.slice(start, end).match(/\r\n|\n/)?.[0]
+    ?? source.match(/\r\n|\n/)?.[0]
+    ?? '\n';
+  return replacement.replace(/\r\n|\n/g, matchedEol);
+}
+
+function renderNumberedLines(lines: string[], start: number, end: number): string {
+  const width = String(end + 1).length;
+  const out: string[] = [];
+  for (let i = start; i <= end; i++) {
+    out.push(`${String(i + 1).padStart(width)}| ${lines[i]}`);
+  }
+  return out.join('\n');
+}
+
+// Deterministic-failure tools: re-issuing the exact same failing call is a
+// loop, not a transient retry. web_search / browse_url can fail transiently
+// (network) and are excluded so a legitimate retry is not blocked.
+const DEDUP_FAILURE_TOOLS = new Set<ToolName>(['write_file', 'edit_file', 'run_terminal']);
 
 export async function runTool(name: ToolName, args: Record<string, string>, sessionId?: string): Promise<ToolResult> {
+  const dedup = DEDUP_FAILURE_TOOLS.has(name);
+  const callKey = dedup ? failedCallKey(name, args) : '';
+  if (dedup && hasFailedBefore(sessionId, callKey)) {
+    return {
+      success: false,
+      output: `This exact ${name} call already failed earlier in this run and was not run again. Repeating an identical failing call is a loop. Change the arguments or the approach (read the file in a small chunk first, fix the specific error, or move to the next step).`,
+    };
+  }
+  const result = await runToolInner(name, args, sessionId);
+  if (dedup && !result.success) recordFailedCall(sessionId, callKey);
+  return result;
+}
+
+async function runToolInner(name: ToolName, args: Record<string, string>, sessionId?: string): Promise<ToolResult> {
   try {
     switch (name) {
       case 'web_search':
@@ -292,24 +470,70 @@ export async function runTool(name: ToolName, args: Record<string, string>, sess
         if (typeof args.content !== 'string') {
           return { success: false, output: 'write_file requires a string "content". The previous call was likely truncated; put "filepath" first, then "content", or split the file into smaller write_file calls.' };
         }
+        if (OMITTED_HISTORY_CONTENT.has(args.content.trim())) {
+          return {
+            success: false,
+            output: 'write_file rejected a compacted-history placeholder. This is not file content. Re-read the current file and use edit_file for a targeted exact replacement.',
+          };
+        }
+        if (RESERVED_EXECUTABLE_RE.test(path.basename(args.filepath))) {
+          return { success: false, output: `write_file denied: "${path.basename(args.filepath)}" impersonates a shell/interpreter and would hijack command resolution. Choose a different filename.` };
+        }
         const target = path.resolve(WORKSPACE_DIR, args.filepath);
         if (!target.startsWith(WORKSPACE_DIR)) return { success: false, output: 'Path traversal denied.' };
-        // No-op guard: if the file already exists with byte-identical content,
-        // refuse the write. A weak model that lost its plan will otherwise
-        // rewrite the same file hundreds of times (each returning success and
-        // reinforcing the loop). Returning success:false engages the run's
-        // consecutive-failure pause (3) and kill (5) so the human gets pulled in.
+        // write_file is create-only. Pre-existing/user files AND files this run
+        // already created must go through edit_file (which proves exact old
+        // text). Allowing re-write of the agent's own file did NOT stop weak
+        // models looping — they rewrote it every turn (the gemma4 loop) and
+        // never advanced to the next file — so a full rewrite of a
+        // session-created file is now blocked. Full rewrites happen only in the
+        // final review pass, applied as targeted edit_file changes.
         try {
           const existing = await fs.readFile(target, 'utf-8');
           if (existing === args.content) {
             return { success: false, output: `write_file no-op: "${args.filepath}" already has this exact content. Do not rewrite it identically — you are repeating yourself. Move to the next file or the next step in your plan.` };
           }
-        } catch {
-          // File doesn't exist yet — proceed to create it.
+          if (wasCreatedThisSession(sessionId, target)) {
+            return {
+              success: false,
+              output: `write_file blocked: "${args.filepath}" was already created this run. Full-file rewrites mid-build are not allowed — they cause the rewrite loop and risk output-token truncation. To change it, use edit_file with ONE exact old_str/new_str. If it is already complete, STOP rewriting it and move to the NEXT file or step in your plan.`,
+            };
+          }
+          return {
+            success: false,
+            output: `write_file blocked: "${args.filepath}" already exists and was preserved. write_file only creates new files. Read the relevant 1-${READ_FILE_CHUNK_LINES}-line chunk, then use edit_file with one exact function/component-sized old_str and new_str.`,
+          };
+        } catch (error: any) {
+          if (error?.code !== 'ENOENT') {
+            return { success: false, output: `Unable to inspect existing path "${args.filepath}": ${error?.message ?? String(error)}` };
+          }
         }
         await fs.mkdir(path.dirname(target), { recursive: true });
-        await fs.writeFile(target, args.content, 'utf-8');
-        return { success: true, output: `Written: ${args.filepath}` };
+        try {
+          // `wx` closes the read/create race: another run cannot create the
+          // path between the existence check and this write and then be erased.
+          await fs.writeFile(target, args.content, { encoding: 'utf-8', flag: 'wx' });
+        } catch (error: any) {
+          if (error?.code === 'EEXIST') {
+            if (wasCreatedThisSession(sessionId, target)) {
+              return {
+                success: false,
+                output: `write_file blocked: "${args.filepath}" was already created this run. Full-file rewrites mid-build are not allowed — use edit_file for a targeted change, or move to the NEXT file or step in your plan.`,
+              };
+            }
+            return {
+              success: false,
+              output: `write_file blocked: "${args.filepath}" was created by another operation and was preserved. Re-read it and use edit_file for any change.`,
+            };
+          }
+          throw error;
+        }
+        registerCreatedFile(sessionId, target);
+        // Report size so the model (and the next turn) can tell a real source
+        // file from a tiny placeholder / truncated write.
+        const byteCount = Buffer.byteLength(args.content, 'utf-8');
+        const lineCount = args.content.length === 0 ? 0 : args.content.split(/\r?\n/).length;
+        return { success: true, output: `Written: ${args.filepath} (${byteCount} bytes, ${lineCount} lines)` };
       }
 
       case 'edit_file': {
@@ -326,23 +550,64 @@ export async function runTool(name: ToolName, args: Record<string, string>, sess
         }
         const target = path.resolve(WORKSPACE_DIR, args.filepath);
         if (!target.startsWith(WORKSPACE_DIR)) return { success: false, output: 'Path traversal denied.' };
+
+        const missKey = editMissKey(sessionId, target);
+        const recovery = editRecoveryStates.get(missKey);
+        if (recovery?.locked) {
+          return {
+            success: false,
+            output: `edit_file recovery lock active for "${args.filepath}" after ${recovery.misses} failed match attempts. Read an explicit chunk from this same file with read_file limit=1-${READ_FILE_CHUNK_LINES}, then retry a smaller function/component-level exact edit. Full-file rewrite is not the fallback.`,
+          };
+        }
+
         let source: string;
         try {
           source = await fs.readFile(target, 'utf-8');
         } catch {
           return { success: false, output: `File not found: ${args.filepath}. Use write_file to create a new file.` };
         }
-        const occurrences = source.split(args.old_str).length - 1;
-        if (occurrences === 0) {
-          return { success: false, output: 'old_str was not found in the file. Read the file and copy an exact snippet (including whitespace) to replace.' };
+        const matches = findNewlineInsensitiveMatches(source, args.old_str);
+        if (matches.length === 0) {
+          const state = recovery ?? { misses: 0, locked: false, fullOverwriteUnsafe: false };
+          state.misses++;
+          editRecoveryStates.set(missKey, state);
+
+          if (state.misses === 2) {
+            const sourceLines = source.split(/\r?\n/);
+            const region = await locateSimilarSnippet(sourceLines, args.old_str);
+            const hint = region
+              ? `Closest source window in "${args.filepath}", lines ${region.start + 1}-${region.end + 1}:\n--- BEGIN EXACT UNNUMBERED SOURCE ---\n${sourceLines.slice(region.start, region.end + 1).join('\n')}\n--- END EXACT UNNUMBERED SOURCE ---\nCopy exact source text directly. Next edit attempt remains allowed.`
+              : `No plausible old_str anchor exists in "${args.filepath}". Use read_file in chunks of at most ${READ_FILE_CHUNK_LINES} lines to locate exact source. Next edit attempt remains allowed.`;
+            return {
+              success: false,
+              output: `old_str not found (attempt ${state.misses}). ${hint}`,
+            };
+          }
+
+          if (state.misses >= 3) {
+            state.locked = true;
+            state.fullOverwriteUnsafe = true;
+            return {
+              success: false,
+              output: `old_str not found (attempt ${state.misses}). edit_file recovery lock now active for "${args.filepath}". Full-file rewrite is blocked for existing files over ${READ_FILE_CHUNK_LINES} lines. Read an explicit chunk from this same file with read_file limit=1-${READ_FILE_CHUNK_LINES}, then retry a smaller function/component-level exact edit.`,
+            };
+          }
+
+          return {
+            success: false,
+            output: `old_str was not found in "${args.filepath}" (attempt 1). Do NOT re-read the whole file. Use read_file with limit=${READ_FILE_CHUNK_LINES} and offset to scan in chunks, then retry edit_file copying an exact snippet including whitespace.`,
+          };
         }
-        if (occurrences > 1) {
-          return { success: false, output: `old_str matches ${occurrences} places. Add surrounding context so it matches exactly one location.` };
+        if (matches.length > 1) {
+          return { success: false, output: `old_str matches ${matches.length} places. Add surrounding context so it matches exactly one location.` };
         }
-        if (args.new_str === args.old_str) {
-          return { success: false, output: `edit_file no-op: old_str and new_str are identical — the file would not change. Do not repeat the same edit. Move to the next step.` };
+        const match = matches[0];
+        const replacement = replacementWithMatchedLineEndings(source, match.start, match.end, args.new_str);
+        if (replacement === source.slice(match.start, match.end)) {
+          return { success: false, output: `edit_file no-op: replacement matches existing text — the file would not change. Do not repeat the same edit. Move to the next step.` };
         }
-        await fs.writeFile(target, source.replace(args.old_str, args.new_str), 'utf-8');
+        await fs.writeFile(target, source.slice(0, match.start) + replacement + source.slice(match.end), 'utf-8');
+        editRecoveryStates.delete(missKey);
         return { success: true, output: `Edited: ${args.filepath}` };
       }
 
@@ -352,7 +617,54 @@ export async function runTool(name: ToolName, args: Record<string, string>, sess
         }
         const target = path.resolve(WORKSPACE_DIR, args.filepath);
         if (!target.startsWith(WORKSPACE_DIR)) return { success: false, output: 'Path traversal denied.' };
-        return { success: true, output: await fs.readFile(target, 'utf-8') };
+
+        // Chunked paging: full-file dumps (10KB+) bloat context and measurably
+        // degrade weak models' tool-JSON quality on the next turn. Default
+        // window is 100 lines; offset pages through larger files. Full-file
+        // reads stay available via limit=0 for genuinely small files.
+        const fileContent = await fs.readFile(target, 'utf-8');
+        const totalLines = fileContent.split(/\r?\n/).length;
+        const rawOffset = Number.parseInt(String(args.offset ?? '1'), 10);
+        const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? rawOffset : 1;
+        if (offset > totalLines) {
+          return {
+            success: false,
+            output: `read_file offset ${offset} is past end of "${args.filepath}" (${totalLines} lines). Choose an offset from 1-${totalLines}.`,
+          };
+        }
+        let limit = READ_FILE_CHUNK_LINES;
+        let explicitUnlockingLimit = false;
+        if (args.limit !== undefined) {
+          const parsedLimit = Number.parseInt(String(args.limit), 10);
+          if (Number.isFinite(parsedLimit) && parsedLimit >= 0) {
+            limit = parsedLimit;
+            explicitUnlockingLimit = parsedLimit >= 1 && parsedLimit <= READ_FILE_CHUNK_LINES;
+          }
+        }
+        if (explicitUnlockingLimit) {
+          const recovery = editRecoveryStates.get(editMissKey(sessionId, target));
+          if (recovery?.locked) {
+            recovery.locked = false;
+            recovery.misses = 0;
+          }
+        }
+
+        if (limit === 0 || (offset === 1 && limit >= totalLines)) {
+          // Explicit full read, or a single window that already covers the file.
+          return {
+            success: true,
+            output: `${fileContent}\n\n[${totalLines} lines total${limit > 0 ? ' — full file' : ''}]`,
+          };
+        }
+        const lines = fileContent.split(/\r?\n/);
+        const startIdx = offset - 1;
+        const endIdx = Math.min(lines.length - 1, startIdx + limit - 1);
+        const numbered = renderNumberedLines(lines, startIdx, endIdx);
+        const hasMore = endIdx < lines.length - 1;
+        const footer = hasMore
+          ? `\n\n[Showing lines ${offset}-${endIdx + 1} of ${lines.length}. Continue with offset=${endIdx + 2}, limit=${READ_FILE_CHUNK_LINES}, or jump to a region.]`
+          : `[Showing lines ${offset}-${lines.length} of ${lines.length} — end of file]`;
+        return { success: true, output: `${numbered}${footer}` };
       }
 
       case 'run_terminal': {
@@ -364,6 +676,32 @@ export async function runTool(name: ToolName, args: Record<string, string>, sess
           return { success: false, output: 'run_terminal requires a non-empty string "command".' };
         }
         let command: string = args.command.trim();
+
+        // Leading `cd <dir> && rest` / `cd <dir>; rest`: cmd.exe only keeps the
+        // changed directory within the same shell, and this executor spawns a
+        // fresh shell per call. Instead of passing the `cd` (and the `&&` that
+        // triggered `spawn UNKNOWN`), run the remainder with cwd = that subdir.
+        let effectiveCwd = WORKSPACE_DIR;
+        const cdMatch = command.match(/^cd\s+(?:\/d\s+)?(["']?)([^"'&;|]+)\1\s*(?:&&|;)\s*([\s\S]+)$/i);
+        if (cdMatch) {
+          const requested = path.resolve(WORKSPACE_DIR, cdMatch[2].trim());
+          if (!requested.startsWith(WORKSPACE_DIR)) {
+            return { success: false, output: `run_terminal denied: 'cd ${cdMatch[2].trim()}' leaves the workspace.` };
+          }
+          try { await fs.mkdir(requested, { recursive: true }); } catch {}
+          effectiveCwd = requested;
+          command = cdMatch[3].trim();
+        }
+
+        // File mutations must use write_file/edit_file so their preservation
+        // guarantees cannot be bypassed with common shell redirection, copy,
+        // move, delete, PowerShell content cmdlets, or inline interpreter code.
+        if (terminalCommandMutatesFiles(command)) {
+          return {
+            success: false,
+            output: 'run_terminal blocked a file-mutation command. Use write_file only to create a new file, or read_file plus edit_file to change one exact block in an existing file.',
+          };
+        }
 
         // Prohibit package installation / init commands: agent's role is code generation only
         if (PROHIBITED_INSTALL_RE.test(command)) {
@@ -407,7 +745,7 @@ export async function runTool(name: ToolName, args: Record<string, string>, sess
         const { background, foreground } = splitBackgroundOperator(command);
         const detachedPids: number[] = [];
         if (background) {
-          const pid = startDetached(background);
+          const pid = startDetached(background, effectiveCwd);
           if (pid !== undefined) detachedPids.push(pid);
           command = foreground;
         }
@@ -416,7 +754,7 @@ export async function runTool(name: ToolName, args: Record<string, string>, sess
         //    known server starters and launch them detached so the agent can
         //    probe them with a separate command instead of hanging.
         if (command && !background && LONG_RUNNING_SERVER.test(command)) {
-          const pid = startDetached(command);
+          const pid = startDetached(command, effectiveCwd);
           const pidNote = pid !== undefined ? ` (PID ${pid})` : '';
           return {
             success: true,
@@ -436,7 +774,7 @@ export async function runTool(name: ToolName, args: Record<string, string>, sess
         // The 30-minute timeout is intentionally generous: large project scaffolds
         // and installs on a slow, GPU-less PC can legitimately take many minutes.
         try {
-          const { stdout, stderr } = await execAsync(command, { cwd: WORKSPACE_DIR, timeout: TERMINAL_TIMEOUT_MS, shell: 'cmd.exe' });
+          const { stdout, stderr } = await execAsync(command, { cwd: effectiveCwd, timeout: TERMINAL_TIMEOUT_MS, shell: WIN_SHELL });
           const output = [stdout, stderr].filter(Boolean).join('\n').trim();
           const pidNote = detachedPids.length ? `\n(Background PID(s) started: ${detachedPids.join(', ')}.)` : '';
           return { success: true, output: (output || '(no output)') + pidNote };

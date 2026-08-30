@@ -3,8 +3,9 @@ import { spawn } from 'child_process';
 import fsNative from 'fs';
 import fs from 'fs/promises';
 import path from 'path';
-import { ContextManager, Message, ToolCall } from '../lib/contextManager.js';
-import { runTool, ToolName } from '../lib/toolRunner.js';
+import { ContextManager, Message, ToolCall, estimateMessageTokens, compactToolCall } from '../lib/contextManager.js';
+import { computeThinkBudgetForTurn, shouldRecoverAfterThinkBreach } from '../lib/thinkBudget.js';
+import { runTool, ToolName, clearSessionToolState } from '../lib/toolRunner.js';
 import { TOOL_DEFINITIONS, WORKSPACE_DIR } from '../lib/tools.js';
 import * as novelStorage from '../lib/novel/storage.js';
 import { inferenceDispatcher } from '../lib/inferenceDispatcher.js';
@@ -72,6 +73,13 @@ const CONTEXT_SIZES = new Set([16_384, 32_768, 65_536, 131_072, 262_144]);
 // guidance (ask_user), 5 in a row kills the run for human review. Any success
 // resets the consecutive-failure counter.
 const MAX_CONSECUTIVE_FAILURES = 5;
+// Bounded retries for thinking-only / empty turns before the run is ended.
+const MAX_EMPTY_TURN_RETRIES = 3;
+// End-of-run code review: one bounded review round per run. The reviewer
+// sidecar reads the files the agent changed and flags top issues; the coder
+// gets one chance to fix them before the run completes.
+const MAX_REVIEW_ROUNDS = 1;
+const REVIEW_AT_END = process.env.REVIEW_AT_END !== 'false';
 
 // ── Run watchdog (local runtimes) ──────────────────────────────────────────
 // Kills runs that are provably dead instead of letting them hold VRAM forever,
@@ -112,6 +120,20 @@ const parsedIdleProbes = Number.parseInt(process.env.WATCHDOG_IDLE_PROBES_TO_KIL
 // evidence before a hang verdict. A single bad CPU sample (iGPU offload,
 // counter hiccup) can no longer kill a healthy run.
 const WATCHDOG_IDLE_PROBES_TO_KILL = Number.isFinite(parsedIdleProbes) && parsedIdleProbes > 0 ? parsedIdleProbes : 20;
+// Ollama-only fast liveness: poll the loaded-model list (`ollama ps` == GET
+// /api/ps). On a 32 GB shared-memory laptop, memory pressure makes Ollama
+// unload the model mid-run; the open request then hangs forever with zero
+// tokens. An empty model list is unambiguous proof the runtime dropped the
+// model, so we stop the run instead of waiting out the coarse quiet/turn
+// budgets. A resident-but-slow prefill still lists the model, so this never
+// false-kills a healthy long generation.
+const MODEL_EVICTION_WATCH = process.env.MODEL_EVICTION_WATCH !== 'false';
+const parsedPsIntervalMs = Number.parseInt(process.env.MODEL_PS_INTERVAL_MS ?? '60000', 10);
+const MODEL_PS_INTERVAL_MS = Number.isFinite(parsedPsIntervalMs) && parsedPsIntervalMs > 0 ? parsedPsIntervalMs : 60_000;
+const parsedGoneToKill = Number.parseInt(process.env.MODEL_GONE_CHECKS_TO_KILL ?? '2', 10);
+// Two consecutive empty polls (≈2 min at the default 60s cadence) before the
+// verdict, so a brief gap during a legitimate one-shot model swap can't trip it.
+const MODEL_GONE_CHECKS_TO_KILL = Number.isFinite(parsedGoneToKill) && parsedGoneToKill > 0 ? parsedGoneToKill : 2;
 
 const SESSIONS_DIR = path.resolve(WORKSPACE_DIR, '.sessions');
 const OLLAMA_FAILURE_LOG_PATH = path.resolve(WORKSPACE_DIR, '.logs', 'ollama-failures.jsonl');
@@ -174,39 +196,30 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ── Runtime health probes (watchdog evidence) ──────────────────────────────
 
-interface CpuProbe {
-  ticks: number; // cumulative kernel+user CPU, 100ns units (Get-Counter native)
-  processes: number;
+interface CpuSample {
+  seconds: number; // cumulative process CPU time (user+kernel), monotonic
 }
 
-/** Sample cumulative CPU ticks of ollama/llama-server runner processes via
- *  Get-Counter. Returns null when the counter or processes are unavailable —
- *  an inconclusive probe must never count as evidence of a hang. */
-async function probeRuntimeCpuTicks(backend: InferenceBackend): Promise<CpuProbe | null> {
+/** Sample cumulative CPU-seconds of the runtime's processes via Get-Process
+ *  (.CPU = TotalProcessorTime in seconds, monotonic). Returns null when no
+ *  processes exist or the read fails — an inconclusive probe must never count
+ *  as evidence of a hang. Unlike '% Processor Time' (an instantaneous rate),
+ *  this is cumulative, so two samples a known interval apart yield true
+ *  work-done-per-second. Emitted as integer milliseconds to stay independent
+ *  of the shell's decimal-separator culture. */
+async function sampleRuntimeCpuSeconds(backend: InferenceBackend): Promise<CpuSample | null> {
   // llama.cpp on SYCL still names its executable llama-server; Ollama runners
   // surface as ollama*. Include the generic llama* pattern for custom builds.
   const pattern = backend === 'llamacpp' ? 'llama*' : 'ollama*';
-  const script = `(Get-Counter '\\Process(${pattern})\\% Processor Time' -ErrorAction Stop).CounterSamples | ` +
-    `ForEach-Object { [pscustomobject]@{ name = $_.InstanceName; pct = $_.CookedValue } } | ConvertTo-Json -Compress`;
+  const script = `$p = Get-Process -Name '${pattern}' -ErrorAction SilentlyContinue; `
+    + `if (-not $p) { 'NONE' } else { [int64]((($p | Measure-Object -Property CPU -Sum).Sum) * 1000) }`;
   try {
     const result = await runCommandCapture('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script]);
-    if (result.code !== 0 || !result.stdout.trim()) return null;
-    let parsed: any;
-    try {
-      parsed = JSON.parse(result.stdout.trim());
-    } catch {
-      return null;
-    }
-    const samples = Array.isArray(parsed) ? parsed : [parsed];
-    let totalPercent = 0;
-    for (const sample of samples) {
-      const value = Number(sample?.pct);
-      if (Number.isFinite(value)) totalPercent += value;
-    }
-    // % Processor Time is per-core-normalized by Get-Processor-Time semantics:
-    // CookedValue is already a percentage where 100 = one full core.
-    const cpuSecondsPerSecond = totalPercent / 100;
-    return { ticks: Math.round(cpuSecondsPerSecond * 10_000_000), processes: samples.length };
+    const out = result.stdout.trim();
+    if (result.code !== 0 || !out || out === 'NONE') return null;
+    const ms = Number.parseInt(out, 10);
+    if (!Number.isFinite(ms)) return null;
+    return { seconds: ms / 1000 };
   } catch {
     return null;
   }
@@ -235,36 +248,71 @@ async function probeLlamaCppSlotProgress(): Promise<number | null> {
 }
 
 /**
- * Decide whether a quiet runtime is actually computing. Combines both probes:
- * llama.cpp slot progress when available, otherwise CPU sampling. Any positive
- * signal means "alive"; only conclusive zeros count toward a hang verdict.
+ * Decide whether a quiet runtime is actually computing. Self-contained: for the
+ * CPU signal it takes two cumulative samples WATCHDOG_PROBE_SAMPLE_GAP_MS apart
+ * and measures real work-done-per-second (no reliance on cross-tick state).
+ * llama.cpp additionally uses slot n_past progress when available. Only a
+ * successful measurement is `conclusive`; anything else must not count toward a
+ * hang verdict.
  */
 async function probeRuntimeComputing(
   backend: InferenceBackend,
-  previousCpuTicks: number | null,
   previousNPast: number | null,
-): Promise<{ computing: boolean; cpuTicks: CpuProbe | null; nPast: number | null }> {
+): Promise<{ computing: boolean; conclusive: boolean; nPast: number | null }> {
+  // WATCHDOG_MIN_CPU_TICKS_PER_SEC stays in legacy 100ns-tick units for
+  // back-compat: 500000 ticks/s == 0.05 of one core.
+  const minCoreFraction = WATCHDOG_MIN_CPU_TICKS_PER_SEC / 10_000_000;
+
   if (backend === 'llamacpp') {
     const nPast = await probeLlamaCppSlotProgress();
-    if (nPast !== null && previousNPast !== null && nPast > previousNPast) {
-      return { computing: true, cpuTicks: null, nPast };
+    if (nPast !== null && previousNPast !== null) {
+      return { computing: nPast > previousNPast, conclusive: true, nPast };
     }
-    // Slot data unavailable or frozen — fall back to CPU evidence so a missing
-    // /slots endpoint cannot mask real compute (or fabricate one).
-    const cpuTicks = await probeRuntimeCpuTicks(backend);
-    const computing = nPast === null
-      ? (cpuTicks !== null && previousCpuTicks !== null && cpuTicks.ticks - previousCpuTicks >= WATCHDOG_MIN_CPU_TICKS_PER_SEC * (WATCHDOG_PROBE_SAMPLE_GAP_MS / 1000))
-      : false;
-    return { computing, cpuTicks, nPast };
+    // Slot data unavailable — fall back to the CPU measure so a missing /slots
+    // endpoint can neither mask real compute nor fabricate one.
+    const cpu = await measureCpuCoreFraction(backend);
+    if (cpu === null) return { computing: false, conclusive: false, nPast };
+    return { computing: cpu >= minCoreFraction, conclusive: true, nPast };
   }
 
-  const cpuTicks = await probeRuntimeCpuTicks(backend);
-  if (cpuTicks === null || previousCpuTicks === null) {
-    return { computing: false, cpuTicks, nPast: null }; // inconclusive → not evidence
+  const cpu = await measureCpuCoreFraction(backend);
+  if (cpu === null) return { computing: false, conclusive: false, nPast: null };
+  return { computing: cpu >= minCoreFraction, conclusive: true, nPast: null };
+}
+
+/** Two cumulative CPU-seconds samples WATCHDOG_PROBE_SAMPLE_GAP_MS apart →
+ *  average core utilization over that gap, or null if inconclusive. */
+async function measureCpuCoreFraction(backend: InferenceBackend): Promise<number | null> {
+  const first = await sampleRuntimeCpuSeconds(backend);
+  if (first === null) return null;
+  await sleep(WATCHDOG_PROBE_SAMPLE_GAP_MS);
+  const second = await sampleRuntimeCpuSeconds(backend);
+  if (second === null) return null;
+  const gapSeconds = WATCHDOG_PROBE_SAMPLE_GAP_MS / 1000;
+  if (gapSeconds <= 0) return null;
+  // Clamp tiny negative jitter (counter reset / process restart) to 0.
+  return Math.max(0, second.seconds - first.seconds) / gapSeconds;
+}
+
+/** Names of the models Ollama currently has resident — the HTTP equivalent of
+ *  `ollama ps` (GET /api/ps). Returns null on an inconclusive read (endpoint
+ *  down / bad JSON) so a transient failure is never mistaken for an eviction;
+ *  an empty array means the runtime has unloaded every model. */
+async function listLoadedOllamaModels(): Promise<string[] | null> {
+  try {
+    const resp = await fetch(`${OLLAMA_URL}/api/ps`, {
+      signal: AbortSignal.timeout(3_000),
+      dispatcher: inferenceDispatcher,
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json() as any;
+    if (!Array.isArray(data?.models)) return null;
+    return data.models
+      .map((m: any) => String(m?.name ?? m?.model ?? ''))
+      .filter((name: string) => name.length > 0);
+  } catch {
+    return null;
   }
-  const deltaTicks = cpuTicks.ticks - previousCpuTicks;
-  const minTicks = WATCHDOG_MIN_CPU_TICKS_PER_SEC * (WATCHDOG_PROBE_SAMPLE_GAP_MS / 1000);
-  return { computing: deltaTicks >= minTicks, cpuTicks, nPast: null };
 }
 
 
@@ -287,6 +335,47 @@ async function runCommandCapture(command: string, args: string[]): Promise<{ cod
       resolve({ code: code ?? 1, stdout, stderr });
     });
   });
+}
+
+// Compact text digest of a session for the summarizer sidecar. Keeps user
+// goals, assistant prose (trimmed), and file operations; excludes the most
+// recent two user turns (those stay in the window as raw context) and large
+// file bodies (disk is source of truth). Capped so the summarizer stays fast.
+function buildSessionDigest(messages: Message[]): string {
+  const userIndexes = messages
+    .map((m, i) => (m.role === 'user' ? i : -1))
+    .filter((i) => i >= 0);
+  const cutoff = userIndexes.length >= 2 ? userIndexes[userIndexes.length - 2] : messages.length;
+  const older = messages.slice(0, cutoff);
+
+  const lines: string[] = [];
+  for (const m of older) {
+    if (m.role === 'user') {
+      lines.push(`USER: ${(m.content ?? '').slice(0, 800)}`);
+    } else if (m.role === 'assistant') {
+      const text = (m.content ?? '').trim();
+      if (text) lines.push(`ASSISTANT: ${text.slice(0, 600)}`);
+      for (const tc of m.tool_calls ?? []) {
+        const name = tc.function?.name ?? 'tool';
+        let filepath = '';
+        try {
+          const raw = tc.function?.arguments as unknown;
+          const args = (typeof raw === 'string' ? JSON.parse(raw) : raw) as Record<string, unknown>;
+          if (typeof args?.filepath === 'string') filepath = args.filepath;
+          else if (typeof args?.command === 'string') filepath = String(args.command).slice(0, 120);
+          else if (typeof args?.url === 'string') filepath = args.url;
+          else if (typeof args?.query === 'string') filepath = String(args.query).slice(0, 120);
+        } catch {}
+        lines.push(`TOOL_CALL ${name}: ${filepath}`);
+      }
+    } else if (m.role === 'tool') {
+      const out = (m.content ?? '').trim();
+      if (out && !out.startsWith('[omitted')) lines.push(`TOOL_RESULT (${m.tool_name ?? ''}): ${out.slice(0, 200)}`);
+    }
+  }
+  const digest = lines.join('\n');
+  // Keep the summarizer input bounded regardless of history size.
+  return digest.length > 24_000 ? digest.slice(-24_000) : digest;
 }
 
 function summarizeOllamaMessages(messages: Message[]) {
@@ -355,6 +444,48 @@ async function fileExists(filePath: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+// Role → model id map from model_map.json ("summarizer", "vision", "coder").
+// Used for one-shot sidecar swaps: a small model summarizes context or reads an
+// image, then unloads, so the primary coder keeps the RAM on a 32 GB machine.
+async function getModelRoles(): Promise<Record<string, string>> {
+  const map = await getModelMap();
+  const roles = map?.roles;
+  return roles && typeof roles === 'object' ? roles as Record<string, string> : {};
+}
+
+// One non-streaming call to an auxiliary model. keep_alive:0 unloads it right
+// after so the primary coder can reload without exceeding shared RAM. Returns
+// null on any failure (model not pulled, error) so callers can fall back.
+async function runOneShotModel(
+  model: string,
+  messages: unknown[],
+  signal: AbortSignal,
+  opts: { numCtx?: number; numPredict?: number } = {},
+): Promise<string | null> {
+  try {
+    const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: false,
+        think: false,
+        options: { num_ctx: opts.numCtx ?? 8_192, num_predict: opts.numPredict ?? 1_024 },
+        keep_alive: 0,
+      }),
+      signal,
+      dispatcher: inferenceDispatcher,
+    } as any);
+    if (!resp.ok) return null;
+    const data = await resp.json() as { message?: { content?: string } };
+    const content = data?.message?.content;
+    return typeof content === 'string' && content.trim() ? content.trim() : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1263,12 +1394,149 @@ function decodeXmlEntities(value: string): string {
     .replace(/&#(\d+);/g, (_, code: string) => String.fromCharCode(Number(code)));
 }
 
-// Parse tool-call XML emitted as visible model content.
+interface GemmaFallbackCall {
+  name: string;
+  argumentsText: string;
+  start: number;
+  end: number;
+}
+
+// Gemma 4 sometimes emits its internal call syntax as visible text when native
+// tool parsing is unavailable. Extract balanced argument objects so code/file
+// content containing braces does not truncate the call.
+function extractGemmaFallbackCalls(content: string): GemmaFallbackCall[] {
+  const calls: GemmaFallbackCall[] = [];
+  // Require the protocol at the start of its own line. This avoids executing
+  // examples such as `the model emitted call:write_file{...}` from prose/code.
+  const callPattern = /^[ \t]*call:([A-Za-z_][\w-]*)\s*\{/gim;
+  let match: RegExpExecArray | null;
+
+  while ((match = callPattern.exec(content)) !== null) {
+    const openBrace = callPattern.lastIndex - 1;
+    let depth = 0;
+    let quote = '';
+    let escaped = false;
+    let end = -1;
+
+    for (let i = openBrace; i < content.length; i += 1) {
+      if (content.startsWith('<|"|>', i)) {
+        quote = quote === '"' ? '' : '"';
+        i += 4;
+        continue;
+      }
+      const char = content[i];
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === quote) {
+          quote = '';
+        }
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+      } else if (char === '{') {
+        depth += 1;
+      } else if (char === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          end = i + 1;
+          break;
+        }
+      }
+    }
+
+    if (end < 0) continue;
+    const lineEnd = content.indexOf('\n', end);
+    const trailing = content.slice(end, lineEnd < 0 ? content.length : lineEnd);
+    if (trailing.trim()) continue;
+    calls.push({
+      name: match[1],
+      argumentsText: content.slice(openBrace, end).replace(/<\|"\|>/g, '"'),
+      start: match.index,
+      end,
+    });
+    callPattern.lastIndex = end;
+  }
+  return calls;
+}
+
+function parseGemmaFallbackArguments(value: string): Record<string, unknown> | null {
+  // Ollama's Gemma parser failure commonly emits unquoted property names and
+  // sometimes `=` separators: {filepath:"x",limit=0}.
+  let repaired = '';
+  let quote = '';
+  let escaped = false;
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    repaired += char;
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = '';
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char !== '{' && char !== ',') continue;
+
+    let cursor = i + 1;
+    let whitespace = '';
+    while (cursor < value.length && /\s/.test(value[cursor])) {
+      whitespace += value[cursor];
+      cursor += 1;
+    }
+    const keyMatch = value.slice(cursor).match(/^([A-Za-z_][\w-]*)/);
+    if (!keyMatch) continue;
+    const key = keyMatch[1];
+    cursor += key.length;
+    let afterKeyWhitespace = '';
+    while (cursor < value.length && /\s/.test(value[cursor])) {
+      afterKeyWhitespace += value[cursor];
+      cursor += 1;
+    }
+    if (value[cursor] !== ':' && value[cursor] !== '=') continue;
+
+    repaired += `${whitespace}"${key}"${afterKeyWhitespace}:`;
+    i = cursor;
+  }
+  try {
+    const parsed = JSON.parse(repaired);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// Parse tool calls emitted as visible model content.
 function parseFallbackToolCalls(content: string): ToolCall[] {
   const calls: ToolCall[] = [];
+  const seenCalls = new Set<string>();
   let nextId = 0;
+  const canonicalize = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      return `{${Object.keys(record).sort().map((key) =>
+        `${JSON.stringify(key)}:${canonicalize(record[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value) ?? 'undefined';
+  };
   const addCall = (name: string, args: Record<string, unknown>) => {
     if (!FALLBACK_TOOL_NAMES.has(name as ToolName)) return;
+    const signature = `${name}:${canonicalize(args)}`;
+    if (seenCalls.has(signature)) return;
+    seenCalls.add(signature);
     calls.push({
       id: `fallback-${nextId++}`,
       type: 'function',
@@ -1305,14 +1573,28 @@ function parseFallbackToolCalls(content: string): ToolCall[] {
     }
     addCall(match[1], args);
   }
+  for (const call of extractGemmaFallbackCalls(content)) {
+    const args = parseGemmaFallbackArguments(call.argumentsText);
+    if (args) addCall(call.name, args);
+  }
   return calls;
 }
 
 function removeFallbackToolCallMarkup(content: string): string {
-  return content
+  const withoutXml = content
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
     .replace(/<function=[A-Za-z_][\w-]*(?:\s*>)?[\s\S]*?<\/function>/gi, '')
     .replace(/<\/tool_call>/gi, '');
+  const gemmaCalls = extractGemmaFallbackCalls(withoutXml);
+  if (gemmaCalls.length === 0) return withoutXml;
+
+  let cursor = 0;
+  let cleaned = '';
+  for (const call of gemmaCalls) {
+    cleaned += withoutXml.slice(cursor, call.start);
+    cursor = call.end;
+  }
+  return cleaned + withoutXml.slice(cursor);
 }
 
 function sanitizeNoToolsAssistantContent(content: string): string {
@@ -1422,7 +1704,15 @@ async function getModelCapabilities(model: string, signal: AbortSignal, backend:
       // OR Ollama's report with model_map so either source can enable tools
       supportsTools: (data.capabilities?.includes('tools') ?? false) || mapSupportsTools,
       supportsThinking: (data.capabilities?.includes('thinking') ?? false) || mapSupportsThinking,
-      supportsVision: (data.capabilities?.includes('vision') ?? false) || mapSupportsVision,
+      // Vision is authoritative from Ollama's live report: it reflects whether
+      // an image projector (mmproj) is actually present. A model_map vision:true
+      // must NOT override a live "no vision" — e.g. a VL-derived chat template
+      // shipped without a projector — or we send images the runtime rejects
+      // ("image input is not supported"). Fall back to model_map only when
+      // Ollama returns no capabilities list at all.
+      supportsVision: Array.isArray(data.capabilities)
+        ? data.capabilities.includes('vision')
+        : mapSupportsVision,
       // Prefer Ollama's value; fall back to model_map max_context
       contextLength: data.model_info?.['llama.context_length'] ?? mapContextLength,
       systemPromptType: mapSystemPromptType,
@@ -2031,6 +2321,7 @@ router.post('/unload', async (req: Request, res: Response) => {
 router.post('/reset', async (req: Request, res: Response) => {
   const { sessionId } = req.body as { sessionId: string };
   sessions.delete(sessionId);
+  clearSessionToolState(sessionId);
   const filePath = path.join(SESSIONS_DIR, `${sessionId}.json`);
   await fs.rm(filePath, { force: true });
   res.json({ ok: true });
@@ -2407,12 +2698,82 @@ router.post('/chat', async (req: Request, res: Response) => {
     }
   };
 
-  // Include the just-added user prompt in the selected session's meter before
-  // the model starts responding.
-  send('tokens', requestCtx.getTokenUsage());
+  // The saved session can be much larger than the active runtime context.
+  // Track the estimated outbound window separately so the UI meter reflects
+  // what this request will send, not every historical token kept on disk.
+  const initialOutputReserve = Math.min(
+    Math.max(2_048, outputNumPredict),
+    Math.floor(activeContextSize * 0.25),
+  );
+  let activePromptEstimatedTokens = requestCtx.getModelContext(
+    Math.max(1_024, activeContextSize - initialOutputReserve - 2_048),
+  ).estimatedTokens;
+  const getLiveTokenUsage = (pendingMessages: Message[] = []) => {
+    const usage = requestCtx.getTokenUsage(pendingMessages);
+    return {
+      ...usage,
+      contextUsed: Math.min(
+        activeContextSize,
+        activePromptEstimatedTokens + estimateMessageTokens(pendingMessages),
+      ),
+      contextLimit: activeContextSize,
+    };
+  };
+  const sendTokenUsage = (pendingMessages: Message[] = []) => {
+    send('tokens', getLiveTokenUsage(pendingMessages));
+  };
+  sendTokenUsage();
 
   const ac = new AbortController();
   abortControllers.set(sessionId, ac);
+
+  // ── Vision ingest ────────────────────────────────────────────────────────
+  // If the user attached images but the active model can't see them, describe
+  // them ONCE with the vision-role sidecar and inject that text. The image
+  // bytes are then dropped from the message so the coder never re-encodes them
+  // each turn (saving ~2k tokens/turn) and no large vision primary is needed.
+  const imageAttachments = userMessage?.attachments?.filter((a) => a.kind === 'image') ?? [];
+  if (backend === 'ollama' && imageAttachments.length > 0) {
+    const activeCaps = await getModelCapabilities(model, ac.signal, backend);
+    if (!activeCaps.supportsVision) {
+      const roles = await getModelRoles();
+      const visionModel = roles.vision;
+      if (visionModel) {
+        send('status', { message: `Active model has no vision; describing ${imageAttachments.length} image(s) with ${visionModel}.` });
+        const imgs = await readImageAttachments(SESSIONS_DIR, sessionId, imageAttachments);
+        const description = imgs.length > 0
+          ? await runOneShotModel(
+              visionModel,
+              [{
+                role: 'user',
+                content: 'Describe every attached image in full, exhaustive detail: visible text, UI elements, layout, colors, code, diagrams, error messages — everything an engineer would need to act without seeing it. Output only the description.',
+                images: imgs.map((i) => i.base64),
+              }],
+              ac.signal,
+              { numCtx: 8_192, numPredict: 1_536 },
+            )
+          : null;
+        if (description) {
+          const note: Message = {
+            role: 'system',
+            content: `[Image description from vision model ${visionModel}; the primary model cannot see the raw image(s)]\n${description}`,
+            created_at: Date.now(),
+          };
+          requestCtx.push(note);
+          if (isolated) ctx.push(note);
+          if (userMessage) {
+            const remaining = (userMessage.attachments ?? []).filter((a) => a.kind !== 'image');
+            if (remaining.length > 0) userMessage.attachments = remaining;
+            else delete userMessage.attachments;
+          }
+          await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+          send('status', { message: 'Image description injected into context.' });
+        } else {
+          send('status', { message: 'Vision model unavailable or returned nothing; continuing without an image description.' });
+        }
+      }
+    }
+  }
 
   // ── ask_user pause primitives (closure-scoped to this run) ───────────────
   // approvedCommands: normalized commands the user has already approved this
@@ -2482,10 +2843,13 @@ router.post('/chat', async (req: Request, res: Response) => {
   const runStartedAtMs = Date.now();
   let turnStartedAtMs = Date.now();
   let lastStreamActivityAtMs = Date.now();
-  let lastProbeCpuTicks: number | null = null;
   let lastProbeNPast: number | null = null;
   let consecutiveIdleProbes = 0;
   let quietStatusSentAt = 0;
+  // Ollama model-eviction watch: last /api/ps poll time and how many
+  // consecutive polls found zero models resident.
+  let lastPsCheckAtMs = 0;
+  let consecutiveModelGone = 0;
   const noteStreamActivity = () => {
     lastStreamActivityAtMs = Date.now();
     consecutiveIdleProbes = 0;
@@ -2531,6 +2895,29 @@ router.post('/chat', async (req: Request, res: Response) => {
           // own Promise.race cap enforces TOOL_MAX_DURATION_MS instead.
           if (runStatus === 'tool') return;
 
+          // Fast model-eviction check (Ollama only) — independent of the quiet
+          // window. If the runtime has unloaded every model mid-generation, the
+          // open request will hang forever, so stop the run promptly. Throttled
+          // to MODEL_PS_INTERVAL_MS; only fires after MODEL_GONE_CHECKS_TO_KILL
+          // consecutive empty polls so a legitimate one-shot swap can't trip it.
+          if (MODEL_EVICTION_WATCH && backend === 'ollama' && now - lastPsCheckAtMs >= MODEL_PS_INTERVAL_MS) {
+            lastPsCheckAtMs = now;
+            const loaded = await listLoadedOllamaModels();
+            if (loaded !== null) { // null = inconclusive read; never act on it
+              if (loaded.length === 0) {
+                consecutiveModelGone += 1;
+                console.warn(`[watchdog] session=${sessionId} ollama ps shows no model loaded (${consecutiveModelGone}/${MODEL_GONE_CHECKS_TO_KILL})`);
+                send('status', { message: `Ollama shows no model loaded (${consecutiveModelGone}/${MODEL_GONE_CHECKS_TO_KILL}) — checking for eviction…` });
+                if (consecutiveModelGone >= MODEL_GONE_CHECKS_TO_KILL) {
+                  await killRun('model ejected — Ollama unloaded the model mid-run (likely memory pressure); stopping so the run does not hang');
+                  return;
+                }
+              } else if (consecutiveModelGone > 0) {
+                consecutiveModelGone = 0;
+              }
+            }
+          }
+
           // Budget 2 — single inference turn wall clock.
           if (now - turnStartedAtMs >= TURN_MAX_DURATION_MS) {
             await killRun(`a single generation turn exceeded ${Math.round(TURN_MAX_DURATION_MS / 60_000)} minutes`);
@@ -2549,23 +2936,24 @@ router.post('/chat', async (req: Request, res: Response) => {
             send('status', { message: `Quiet ${Math.round(quietMs / 1000)}s — verifying runtime health…` });
           }
 
-          const probe = await probeRuntimeComputing(backend, lastProbeCpuTicks, lastProbeNPast);
-          const hadPriorCpuSample = lastProbeCpuTicks !== null;
-          lastProbeCpuTicks = probe.cpuTicks?.ticks ?? null;
+          const probe = await probeRuntimeComputing(backend, lastProbeNPast);
           lastProbeNPast = probe.nPast;
 
+          // Inconclusive rounds (probe failed) are never evidence of a hang.
+          if (!probe.conclusive) return;
+
           if (probe.computing) {
+            if (consecutiveIdleProbes > 0) {
+              console.warn(`[watchdog] session=${sessionId} runtime computing again — clearing idle streak`);
+            }
             consecutiveIdleProbes = 0;
             return;
           }
 
-          // Inconclusive rounds (probe failed / no prior sample to diff) are
-          // never evidence of a hang — wait for the next tick.
-          if (probe.cpuTicks === null && probe.nPast === null) return;
-          if (probe.nPast === null && !hadPriorCpuSample) return;
-
           consecutiveIdleProbes += 1;
           console.warn(`[watchdog] session=${sessionId} idle probe ${consecutiveIdleProbes}/${WATCHDOG_IDLE_PROBES_TO_KILL} quiet=${Math.round(quietMs / 1000)}s`);
+          // Make the count-down visible so a stall never looks silent again.
+          send('status', { message: `Runtime idle ${consecutiveIdleProbes}/${WATCHDOG_IDLE_PROBES_TO_KILL} — will stop the run if it stays idle` });
           if (consecutiveIdleProbes >= WATCHDOG_IDLE_PROBES_TO_KILL) {
             await killRun(`runtime confirmed hung — no tokens and no compute for ~${Math.round((STALL_QUIET_MS + WATCHDOG_IDLE_PROBES_TO_KILL * WATCHDOG_PROBE_INTERVAL_MS) / 60_000)} min`);
           }
@@ -2584,6 +2972,16 @@ router.post('/chat', async (req: Request, res: Response) => {
   // Consecutive failures (reset on any success). 3 → pause for guidance,
   // 5 → kill the run for human review. Cumulative counts above are for logs.
   let consecutiveFailures = 0;
+  // Consecutive thinking-only / empty turns. Bounded retries with an explicit
+  // "emit a tool call or final answer" nudge before the run is ended.
+  let emptyTurnCount = 0;
+  // Token estimate at the last rolling-summary generation, so the summary is
+  // only regenerated after meaningful further growth.
+  let lastSummaryTokens = 0;
+  // Files this run created/edited (for the end-of-run review pass) and how
+  // many review rounds have already fired.
+  const runChangedFiles = new Set<string>();
+  let reviewRounds = 0;
   const recentFailures: { name: string; detail: string }[] = [];
   // Set when the run is killed (5 consecutive failures) to exit the loop.
   let killed = false;
@@ -2656,6 +3054,18 @@ router.post('/chat', async (req: Request, res: Response) => {
     // results already in the conversation.
     let forceFinalResponse = false;
     let finalResponseRetryCount = 0;
+    let contextOverflowRetryCount = 0;
+    let contextBudgetPenalty = 0;
+    // Ollama can return HTTP 200 while silently discarding a malformed native
+    // Gemma tool call. Retry once without native tool parsing so the raw call
+    // remains visible and can be repaired by parseFallbackToolCalls.
+    let nativeToolRecoveryRetry = false;
+    // Set when a turn's hidden reasoning crossed the think budget and the
+    // stream was cut. Forces think:false for the rest of THIS run so the model
+    // spends its output on a real tool call / answer instead of another
+    // runaway thought. Bounded by budgetInterruptionCount below.
+    let forceNoThinkForRun = false;
+    let budgetInterruptionCount = 0;
     // Tracks whether a terminal SSE event (done/stopped/error) was emitted.
     // Some loop exits (e.g. forced-final-response retry exhaustion) leave the
     // loop without a 'done', which would strand the client in a running state.
@@ -2677,14 +3087,66 @@ router.post('/chat', async (req: Request, res: Response) => {
         && capabilities.supportsTools;
       currentSystemPromptType = capabilities.systemPromptType;
       currentAllowTools = allowTools;
+      const outputReserve = Math.min(
+        Math.max(2_048, outputNumPredict),
+        Math.floor(activeContext * 0.25),
+      );
+      const nonHistoryReserve = (allowTools ? 2_048 : 1_024) + outputReserve + contextBudgetPenalty;
+      const historyBudget = Math.max(1_024, activeContext - nonHistoryReserve);
+
+      // Rolling LLM summary: once history passes ~50% of the runtime window,
+      // fold the older turns into a durable brief with the summarizer sidecar
+      // so continuity survives when raw turns are dropped. Regenerated only on
+      // meaningful further growth; unavailable summarizer falls back to the
+      // heuristic compaction notice below.
+      if (backend === 'ollama' && !isolated && !forceFinalResponse) {
+        const estTokens = requestCtx.getTokenEstimate();
+        const growthSinceSummary = estTokens - lastSummaryTokens;
+        if (estTokens > activeContext * 0.5 && growthSinceSummary > activeContext * 0.15) {
+          const roles = await getModelRoles();
+          const summarizer = roles.summarizer;
+          if (summarizer) {
+            const digest = buildSessionDigest(requestCtx.getMessages());
+            if (digest) {
+              send('status', { message: `Context past 50%; summarizing earlier work with ${summarizer}.` });
+              const summary = await runOneShotModel(
+                summarizer,
+                [
+                  { role: 'system', content: 'You compress an in-progress software engineering session into a durable brief for the coding model that continues the work. Capture: the user\'s goals, decisions made, files created or edited (with their purpose), current state, and the immediate next steps. Be specific and terse. Do not invent facts. Output only the brief.' },
+                  { role: 'user', content: digest },
+                ],
+                ac.signal,
+                { numCtx: 32_768, numPredict: 1_024 },
+              );
+              if (summary) {
+                requestCtx.setDurableSummary(summary);
+                lastSummaryTokens = estTokens;
+                await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+                send('status', { message: 'Rolling summary updated.' });
+              } else {
+                // Avoid hammering an unavailable summarizer every turn.
+                lastSummaryTokens = estTokens;
+              }
+            }
+          }
+        }
+      }
+
+      const contextWindow = requestCtx.getModelContext(historyBudget);
+      if (contextWindow.compacted && iterationNumber === 1) {
+        send('status', {
+          message: `Context compacted for ${Math.round(activeContext / 1_024)}k runtime window; full chat remains saved.`,
+        });
+      }
+      const contextMessages = contextWindow.messages;
       const modelMessages = forceFinalResponse
-        ? [...requestCtx.getMessages(), {
+        ? [...contextMessages, {
           role: 'system' as const,
           content: 'Research tools are no longer available for this run. Write the final report now using only successful tool results already provided. Clearly disclose the search limitation, distinguish verified findings from unknowns, and do not call tools or invent sources.',
         }]
         : allowTools
-          ? requestCtx.getMessages()
-          : requestCtx.getMessages()
+          ? contextMessages
+          : contextMessages
             .filter((message) => message.role !== 'tool')
             .map(({ tool_calls, ...message }) => message);
 
@@ -2695,10 +3157,10 @@ router.post('/chat', async (req: Request, res: Response) => {
       const CAVEMAN_TOOL_DEFINITIONS = [
         { type: 'function', function: { name: 'web_search',   description: 'Brave Search; DuckDuckGo only if Brave reports exhausted credits. Returns results.', parameters: { type: 'object', properties: { query:    { type: 'string' } }, required: ['query'] } } },
         { type: 'function', function: { name: 'browse_url',   description: 'Fetch URL. Returns page text.',               parameters: { type: 'object', properties: { url:      { type: 'string' } }, required: ['url'] } } },
-        { type: 'function', function: { name: 'write_file',   description: 'Write new file to agent-workspace.',           parameters: { type: 'object', properties: { filepath: { type: 'string' }, content: { type: 'string' } }, required: ['filepath', 'content'] } } },
-        { type: 'function', function: { name: 'edit_file',    description: 'Fix part of existing file. Replace one unique old_str with new_str. Use for edits, not full rewrite.', parameters: { type: 'object', properties: { filepath: { type: 'string' }, old_str: { type: 'string' }, new_str: { type: 'string' } }, required: ['filepath', 'old_str', 'new_str'] } } },
-        { type: 'function', function: { name: 'read_file',    description: 'Read file from agent-workspace.',             parameters: { type: 'object', properties: { filepath: { type: 'string' } }, required: ['filepath'] } } },
-        { type: 'function', function: { name: 'run_terminal', description: 'Run shell command in agent-workspace.',        parameters: { type: 'object', properties: { command:  { type: 'string' } }, required: ['command'] } } },
+        { type: 'function', function: { name: 'write_file',   description: 'Create NEW file only. Existing files never overwritten; change them with exact edit_file replacements. History placeholders are not content.', parameters: { type: 'object', properties: { filepath: { type: 'string' }, content: { type: 'string' } }, required: ['filepath', 'content'] } } },
+        { type: 'function', function: { name: 'edit_file',    description: 'Replace one exact unique block. Functional rewrites: one function/component per call.', parameters: { type: 'object', properties: { filepath: { type: 'string' }, old_str: { type: 'string' }, new_str: { type: 'string' } }, required: ['filepath', 'old_str', 'new_str'] } } },
+        { type: 'function', function: { name: 'read_file',    description: 'Read numbered file chunk. Default 100 lines.', parameters: { type: 'object', properties: { filepath: { type: 'string' }, offset: { type: 'number' }, limit: { type: 'number' } }, required: ['filepath'] } } },
+        { type: 'function', function: { name: 'run_terminal', description: 'Run validation/build/server shell command. Shell file mutations blocked; use write_file/edit_file.', parameters: { type: 'object', properties: { command:  { type: 'string' } }, required: ['command'] } } },
       ];
 
       const CAVEMAN_DIRECTIVE = [
@@ -2713,12 +3175,18 @@ router.post('/chat', async (req: Request, res: Response) => {
 
       const isFirstTurn = iterationNumber === 1;
       const isErrorTurn = lastToolWasError;
-      const thinkBudgetForTurn: number = (() => {
-        if (THINK_BUDGET_INITIAL === 0 || !think) return 0;
-        if (backend === 'ollama' && !capabilities.supportsThinking) return 0;
-        if (isFirstTurn || isErrorTurn) return THINK_BUDGET_INITIAL;
-        return Math.max(100, Math.round(THINK_BUDGET_INITIAL * THINK_BUDGET_FOLLOWUP_RATIO));
-      })();
+      // Once a turn overran the think budget, thinking stays off for the rest
+      // of the run so a weak model cannot burn its whole output window inside
+      // <think> a second time.
+      const effectiveThink = Boolean(think) && !forceNoThinkForRun;
+      const thinkBudgetForTurn: number = computeThinkBudgetForTurn({
+        initialBudget: THINK_BUDGET_INITIAL,
+        followupRatio: THINK_BUDGET_FOLLOWUP_RATIO,
+        thinkEnabled: effectiveThink,
+        supportsThinking: backend !== 'ollama' || capabilities.supportsThinking,
+        isFirstTurn,
+        isErrorTurn,
+      });
 
       if (thinkBudgetForTurn > 0 && !forceFinalResponse) {
         let directiveContent = '';
@@ -2740,6 +3208,22 @@ router.post('/chat', async (req: Request, res: Response) => {
         modelMessages.push({ role: 'system' as const, content: directiveContent });
       }
 
+      // File-writing discipline for tool-enabled coder turns. The recurring
+      // failure was source code drafted inside <think> until the output budget
+      // ran out, leaving only a placeholder or a truncated write_file. Keep
+      // source strictly in tool arguments and require substantive files.
+      if (allowTools && selectedPersona === 'coder' && !forceFinalResponse) {
+        modelMessages.push({
+          role: 'system' as const,
+          content: [
+            'File-writing discipline:',
+            '- Put all source code ONLY inside write_file/edit_file arguments. Never draft file bodies inside <think> or in visible prose.',
+            '- In each write_file call, emit "filepath" first, then the complete "content" for that file. Do not write placeholder, stub, or comment-only files (e.g. a lone "/* init */").',
+            '- Write one complete, substantive file per write_file call, then move to the next file. To change a file you already wrote, use edit_file with one exact old_str/new_str.',
+            '- If a file is too large for one response, split it across multiple write_file calls to the SAME path is NOT allowed (write_file is create-only); instead create it once with a complete first section, then extend it with edit_file.',
+          ].join('\n'),
+        });
+      }
       if (caveman) {
         modelMessages.push({ role: 'system' as const, content: CAVEMAN_DIRECTIVE });
       }
@@ -2749,6 +3233,22 @@ router.post('/chat', async (req: Request, res: Response) => {
           content: 'No tools are available in this runtime. Do not emit tool calls, XML tags, function-like commands, or <think> blocks. Reply directly to the user in plain markdown.',
         });
       }
+      if (nativeToolRecoveryRetry) {
+        modelMessages.push({
+          role: 'system' as const,
+          content: [
+            'Your previous response contained no usable text or parsed tool call. Ollama may have rejected malformed native tool syntax.',
+            'Native tool parsing is disabled for this one recovery response.',
+            'If you intended a tool call, emit exactly one valid JSON call in this form and no other text:',
+            '<tool_call>{"name":"read_file","arguments":{"filepath":"path/to/file","offset":1,"limit":100}}</tool_call>',
+            'Replace the example name and arguments with the intended provided tool. Quote every JSON key and string value. Do not emit call:name{...} syntax.',
+            'If no tool is needed, answer the user directly in plain text.',
+          ].join('\n'),
+        });
+      }
+
+      activePromptEstimatedTokens = estimateMessageTokens(modelMessages) + (allowTools ? 1_024 : 0);
+      sendTokenUsage();
 
       const normalizedMessages = normalizeOllamaMessages(modelMessages, capabilities.systemPromptType);
       let assistantContent = '';
@@ -2783,7 +3283,7 @@ router.post('/chat', async (req: Request, res: Response) => {
           }),
         );
         let turnNumPredict = outputNumPredict;
-        if (think && !isNovelDraft) {
+        if (effectiveThink && !isNovelDraft) {
           turnNumPredict = OLLAMA_NUM_PREDICT + (thinkBudgetForTurn > 0 ? thinkBudgetForTurn : THINKING_NUM_PREDICT_OVERHEAD);
         }
         const body = {
@@ -2792,14 +3292,14 @@ router.post('/chat', async (req: Request, res: Response) => {
           stream: true,
           // Supported by current Ollama releases; prevents models with optional
           // reasoning from spending their visible response on a hidden plan.
-          think: Boolean(think),
+          think: Boolean(effectiveThink && !nativeToolRecoveryRetry),
           options: {
             num_ctx: activeContext,
             num_predict: turnNumPredict,
             ...(requestedNumThread !== undefined ? { num_thread: requestedNumThread } : {}),
           },
           keep_alive: OLLAMA_KEEP_ALIVE,
-          ...(allowTools ? { tools: activeToolDefs } : {}),
+          ...(allowTools && !nativeToolRecoveryRetry ? { tools: activeToolDefs } : {}),
         };
 
         ollamaRequestStartedAt = Date.now();
@@ -2807,8 +3307,18 @@ router.post('/chat', async (req: Request, res: Response) => {
         const ollamaResp = await fetchOllamaChat(body, ac.signal);
 
         if (!ollamaResp.ok) {
-          await recordOllamaFailure('ollama_http', new Error('Ollama returned a non-OK response'), ollamaResp);
           const detail = await ollamaResp.text();
+          const contextOverflow = ollamaResp.status === 400
+            && /exceed(?:s|ed)?(?:_| )context|context size|n_prompt_tokens/i.test(detail);
+          if (contextOverflow && contextOverflowRetryCount < 1) {
+            contextOverflowRetryCount += 1;
+            contextBudgetPenalty = Math.max(4_096, Math.floor(activeContext * 0.15));
+            send('status', {
+              message: 'Runtime rejected prompt size; compacting more aggressively and retrying once.',
+            });
+            continue;
+          }
+          await recordOllamaFailure('ollama_http', new Error('Ollama returned a non-OK response'), ollamaResp);
           // A model may have been removed after this chat was saved. Clear its
           // persisted selection so reopening the chat cannot keep retrying it.
           if (ollamaResp.status === 404) {
@@ -2819,6 +3329,7 @@ router.post('/chat', async (req: Request, res: Response) => {
         }
 
         currentOllamaPhase = 'ollama_stream';
+        contextOverflowRetryCount = 0;
         const appendThinking = (content: string) => {
           if (!content) return;
           assistantThinking += content;
@@ -2826,25 +3337,32 @@ router.post('/chat', async (req: Request, res: Response) => {
             const thinkBudgetChars = thinkBudgetForTurn * THINK_TOKENS_TO_CHARS;
             if (assistantThinking.length > thinkBudgetChars && !thinkBudgetExceededThisTurn) {
               thinkBudgetExceededThisTurn = true;
+              // Enforce, don't just warn: disable thinking for the rest of the
+              // run and signal the read loop to cut this stream so the model
+              // cannot keep drafting a whole file inside <think> until it hits
+              // the output-token cap (which is what silently loses source).
+              forceNoThinkForRun = true;
               send('think_budget_exceeded', {
                 budget: thinkBudgetForTurn,
                 actual: Math.round(assistantThinking.length / THINK_TOKENS_TO_CHARS),
                 iteration: iterationNumber,
               });
-              console.warn(`[think-budget] session=${sessionId} turn=${iterationNumber} budget=${thinkBudgetForTurn} actual≈${Math.round(assistantThinking.length / THINK_TOKENS_TO_CHARS)} tokens exceeded`);
+              console.warn(`[think-budget] session=${sessionId} turn=${iterationNumber} budget=${thinkBudgetForTurn} actual≈${Math.round(assistantThinking.length / THINK_TOKENS_TO_CHARS)} tokens exceeded — cutting stream and disabling thinking for the run`);
             }
           }
           if (!caveman) {
             send('thinking', { content });
           }
-          send('tokens', requestCtx.getTokenUsage([{
+          sendTokenUsage([{
             role: 'assistant',
             content: assistantContent,
             thinking: assistantThinking,
             tool_calls: pendingToolCalls,
-          }]));
+          }]);
         };
-        const startInsideThink = Boolean(think && capabilities.supportsThinking);
+        const startInsideThink = Boolean(
+          effectiveThink && capabilities.supportsThinking && !nativeToolRecoveryRetry,
+        );
         const visibleContent = createVisibleContentFilter(appendThinking, startInsideThink);
 
         const reader = ollamaResp.body!.getReader();
@@ -2852,6 +3370,13 @@ router.post('/chat', async (req: Request, res: Response) => {
         let buf = '';
 
         while (true) {
+          // A think-budget breach cuts the stream: stop reading and cancel the
+          // upstream response so the runtime stops generating the runaway
+          // thought. The turn is then handled by the recovery branch below.
+          if (thinkBudgetExceededThisTurn) {
+            try { await reader.cancel(); } catch {}
+            break;
+          }
           const { done, value } = await reader.read();
           if (done || ac.signal.aborted) break;
 
@@ -2897,7 +3422,7 @@ router.post('/chat', async (req: Request, res: Response) => {
                 assistantContent += content;
                 pendingPartialContent = assistantContent;
                 send('token', { content });
-                send('tokens', requestCtx.getTokenUsage([{ role: 'assistant', content: assistantContent }]));
+                sendTokenUsage([{ role: 'assistant', content: assistantContent }]);
                 void saveProgress(assistantContent);
               }
             }
@@ -2908,12 +3433,12 @@ router.post('/chat', async (req: Request, res: Response) => {
               for (const tc of msg.tool_calls) {
                 pendingToolCalls.push(tc);
               }
-              send('tokens', requestCtx.getTokenUsage([{
+              sendTokenUsage([{
                 role: 'assistant',
                 content: assistantContent,
                 thinking: assistantThinking,
                 tool_calls: pendingToolCalls,
-              }]));
+              }]);
             }
           }
         }
@@ -3031,7 +3556,7 @@ router.post('/chat', async (req: Request, res: Response) => {
           markGenerationStarted();
           send('token', { content: assistantContent });
         }
-        send('tokens', requestCtx.getTokenUsage([{ role: 'assistant', content: assistantContent }]));
+        sendTokenUsage([{ role: 'assistant', content: assistantContent }]);
         await saveProgress(assistantContent, true);
       }
 
@@ -3042,6 +3567,80 @@ router.post('/chat', async (req: Request, res: Response) => {
           assistantContent = removeFallbackToolCallMarkup(assistantContent);
         }
       }
+
+      // Think-budget breach recovery. The stream was cut mid-thought, so the
+      // interrupted reasoning is deliberately discarded (never pushed to
+      // context) and the model is asked to redo the turn with thinking off and
+      // tools still available, so it emits a real tool call / answer instead of
+      // another runaway thought. Bounded so a persistently mute model still
+      // falls through to the empty-turn ladder.
+      if (
+        shouldRecoverAfterThinkBreach({
+          backendOllama: backend === 'ollama',
+          budgetExceededThisTurn: thinkBudgetExceededThisTurn,
+          hasVisibleContent: Boolean(assistantContent.trim()),
+          hasPendingToolCalls: pendingToolCalls.length > 0,
+          interruptionCount: budgetInterruptionCount,
+          maxRetries: MAX_EMPTY_TURN_RETRIES,
+          aborted: ac.signal.aborted,
+        })
+      ) {
+        budgetInterruptionCount += 1;
+        nativeToolRecoveryRetry = false;
+        pendingPartialContent = '';
+        requestCtx.push({
+          role: 'system',
+          content: 'Your internal reasoning exceeded its budget and was cut off. Thinking is now disabled for the rest of this task. Do NOT plan silently. Emit EITHER exactly one tool call now (put "filepath" before the complete "content" for write_file), OR your final answer in plain text. Write source code only inside tool arguments, never in your thoughts.',
+          created_at: Date.now(),
+        });
+        send('status', { message: `Reasoning budget exceeded (${budgetInterruptionCount}/${MAX_EMPTY_TURN_RETRIES}); disabling thinking for this run and retrying with a direct tool call.` });
+        await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+        continue;
+      }
+
+      if (backend === 'ollama' && !assistantContent.trim() && pendingToolCalls.length === 0) {
+        // Step 1: a thinking-only / empty turn. Retry once with native tool
+        // parsing disabled and thinking off (think:false is derived from
+        // nativeToolRecoveryRetry in the request body), so a malformed native
+        // tool call becomes repairable and the model spends the turn on output.
+        if (allowTools && !nativeToolRecoveryRetry && !ac.signal.aborted) {
+          nativeToolRecoveryRetry = true;
+          send('status', {
+            message: 'Runtime returned an empty tool response; retrying once with visible tool-call recovery.',
+          });
+          continue;
+        }
+
+        // Step 2: still empty. Rather than silently ending the run (the "model
+        // thinks, emits nothing, session dies" pattern), push an explicit
+        // directive and let the model try again a bounded number of times.
+        // Each empty turn counts as a consecutive failure so a persistently
+        // mute model is eventually killed for review instead of hanging.
+        emptyTurnCount += 1;
+        consecutiveFailures += 1;
+        recentFailures.push({ name: 'empty_turn', detail: 'model produced only reasoning, no answer or tool call' });
+        if (!ac.signal.aborted && emptyTurnCount < MAX_EMPTY_TURN_RETRIES && consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+          nativeToolRecoveryRetry = false;
+          requestCtx.push({
+            role: 'system',
+            content: 'Your previous turn produced only internal reasoning and no visible output. Do NOT think silently. Emit EITHER exactly one tool call now, OR your final answer to the user in plain text. If the task is finished, state that it is done and summarize what you built.',
+            created_at: Date.now(),
+          });
+          send('status', { message: `Empty turn ${emptyTurnCount}/${MAX_EMPTY_TURN_RETRIES}; nudging the model to emit a tool call or final answer.` });
+          await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+          continue;
+        }
+
+        const message = 'The model produced only reasoning with no answer or tool call across multiple attempts. It may be stuck or the context may be too large; try again, reduce the context, or switch models.';
+        await recordOllamaFailure('ollama_stream', new Error(message));
+        send('error', { message });
+        terminalSent = true;
+        iterating = false;
+        break;
+      }
+      nativeToolRecoveryRetry = false;
+      // A turn with real output clears the empty-turn streak.
+      emptyTurnCount = 0;
 
       // Push assistant response. For novel drafts strip [END_OF_CHAPTER] from the
       // stored context so continuation passes don't see the model's own "done"
@@ -3394,6 +3993,20 @@ router.post('/chat', async (req: Request, res: Response) => {
             // Any success resets the consecutive-failure streak.
             consecutiveFailures = 0;
             recentFailures.length = 0;
+            // Live context compaction: once a write_file/edit_file succeeds, the
+            // file on disk is the source of truth, so drop the (often large)
+            // content/old_str/new_str from the stored assistant tool call
+            // immediately. pendingToolCalls entries are the same object
+            // references held on the persisted assistant message, so mutating
+            // arguments here shrinks what the next turn sends without touching
+            // the file itself. Prevents context ballooning within one turn set.
+            if (toolName === 'write_file' || toolName === 'edit_file') {
+              try {
+                const compacted = compactToolCall(tc as ToolCall);
+                if (tc.function) tc.function.arguments = compacted.function.arguments;
+              } catch {}
+              if (typeof args.filepath === 'string') runChangedFiles.add(args.filepath);
+            }
           }
           lastToolMetadata = { name: toolName, success: result.success, durationMs: toolDurationMs };
 
@@ -3426,13 +4039,13 @@ router.post('/chat', async (req: Request, res: Response) => {
           const resumedRun = activeRuns.get(sessionId);
           if (resumedRun) {
             resumedRun.status = 'thinking';
-            resumedRun.statusText = 'Processing results…';
+            resumedRun.statusText = 'Planning next step…';
             resumedRun.partialContent = '';
           }
         }
 
         lastToolWasError = anyToolFailedInTurn;
-        send('tokens', requestCtx.getTokenUsage());
+        sendTokenUsage();
         await saveSessionToFile(sessionId, ctx, selectedPersona, model);
         if (killed) {
           break; // 5 consecutive failures — exit the run for human review
@@ -3440,8 +4053,79 @@ router.post('/chat', async (req: Request, res: Response) => {
         continue;
       }
 
+      // ── End-of-run code review (one bounded round) ────────────────────────
+      // The run is about to finish and files were changed: give a small
+      // reviewer sidecar ONE look at them. Findings are handed back to the
+      // coder as fix instructions; a clean (or unavailable) reviewer lets the
+      // run complete normally. Hard-capped so it can never ping-pong.
+      if (
+        REVIEW_AT_END
+        && backend === 'ollama'
+        && !isolated
+        && selectedPersona === 'coder'
+        && !forceFinalResponse
+        && runChangedFiles.size > 0
+        && reviewRounds < MAX_REVIEW_ROUNDS
+        && !ac.signal.aborted
+      ) {
+        const rolesNow = await getModelRoles();
+        const reviewer = rolesNow.reviewer;
+        if (reviewer) {
+          reviewRounds += 1;
+          const digestParts: string[] = [];
+          let digestBytes = 0;
+          for (const relPath of Array.from(runChangedFiles)) {
+            try {
+              const abs = path.resolve(WORKSPACE_DIR, relPath);
+              if (!abs.startsWith(WORKSPACE_DIR)) continue;
+              const content = await fs.readFile(abs, 'utf-8');
+              const head = content.split(/\r?\n/).slice(0, 120).join('\n').slice(0, 8_000);
+              if (!head.trim()) continue;
+              const part = `--- ${relPath} ---\n${head}`;
+              if (digestBytes + part.length > 24_000) break;
+              digestParts.push(part);
+              digestBytes += part.length;
+            } catch {}
+          }
+          const fileDigest = digestParts.join('\n\n');
+          if (fileDigest) {
+            send('status', { message: `Running final code review with ${reviewer} on ${runChangedFiles.size} changed file(s)…` });
+            const findings = await runOneShotModel(
+              reviewer,
+              [
+                { role: 'system', content: 'You are a strict but pragmatic code reviewer for an in-progress build on a small local setup. Report ONLY defects that would break or seriously degrade this code: syntax errors, undefined references/missing imports, logic errors, broken wiring between files, obvious framework misuse. Do NOT report style, naming, performance micro-issues, or hypothetical improvements. Output at most one issue per line in the exact format "file:line: issue" using the paths given. If nothing serious is wrong, output exactly: CLEAN' },
+                { role: 'user', content: `Review these files written by another model.\n\n${fileDigest}` },
+              ],
+              ac.signal,
+              { numCtx: 16_384, numPredict: 512 },
+            );
+            const cleaned = (findings ?? '').trim();
+            const hasFindings = Boolean(cleaned)
+              && !/^clean\b/i.test(cleaned)
+              && /:\s*\d+\s*:/.test(cleaned);
+            if (hasFindings) {
+              const trimmedFindings = cleaned.split('\n').filter(Boolean).slice(0, 12).join('\n');
+              requestCtx.push({
+                role: 'user',
+                content: [
+                  'A separate reviewer model flagged these concrete issues in the files you just wrote. Fix each one with targeted edit_file calls now (read_file first if you need exact source), then confirm what you fixed.',
+                  '',
+                  trimmedFindings,
+                ].join('\n'),
+                created_at: Date.now(),
+              });
+              if (isolated) ctx.push({ role: 'user', content: 'Reviewer findings pending — see prior message.', created_at: Date.now() });
+              await saveSessionToFile(sessionId, ctx, selectedPersona, model);
+              send('status', { message: 'Reviewer found issues; handing them to the coder to fix.' });
+              continue; // coder gets one repair turn before done
+            }
+            if (cleaned) send('status', { message: 'Final code review passed with no blocking issues.' });
+          }
+        }
+      }
+
       iterating = false;
-      send('tokens', requestCtx.getTokenUsage());
+      sendTokenUsage();
       send('done', {});
       terminalSent = true;
     }
@@ -3457,7 +4141,7 @@ router.post('/chat', async (req: Request, res: Response) => {
       // Any non-abort exit that did not already emit 'done' (e.g. forced-final
       // -response retry exhaustion) must still send one, or the client stream
       // closes with no terminal event and the UI stays stuck as if running.
-      send('tokens', requestCtx.getTokenUsage());
+      sendTokenUsage();
       send('done', {});
       terminalSent = true;
     }

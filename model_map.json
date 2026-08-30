@@ -1,25 +1,46 @@
 {
     "version": "1.0",
     "default_model": "qwen3-coder:30b",
+    "roles": {
+        "coder": "qooba/qwen3-coder-30b-a3b-instruct:q3_k_m",
+        "summarizer": "qwen3:4b",
+        "vision": "huihui_ai/qwen3-vl-abliterated:2b",
+        "reviewer": "qwen3:4b"
+    },
     "models": [
-        {
-            "id": "mirage335/Llama-3_1-8B-Instruct-abliterated-virtuoso:latest",
-            "name": "Llama 3.1 8B Virtuoso (Abliterated)",
+                {
+            "id": "qwen3:4b",
+            "name": "Qwen 3 4B (Dense)",
             "size_gb": 8.5,
             "max_context": 131072,
             "quantization": "Q8_0",
             "capabilities": {
                 "vision": false,
                 "function_calling": true,
-                "thinking_mode": false,
+                "thinking_mode": true,
+                "uncensored": false
+            },
+            "system_prompt_type": "llama3",
+            "recommended_use": "Fast general instruction, creative writing, uncensored chat"
+        },
+        {
+            "id": "huihui_ai/qwen3-vl-abliterated:2b",
+            "name": "Qwen 3 VL 2B Uncen (Dense)",
+            "size_gb": 8.5,
+            "max_context": 131072,
+            "quantization": "Q8_0",
+            "capabilities": {
+                "vision": true,
+                "function_calling": true,
+                "thinking_mode": true,
                 "uncensored": true
             },
             "system_prompt_type": "llama3",
             "recommended_use": "Fast general instruction, creative writing, uncensored chat"
         },
         {
-            "id": "GFalcon-UA/dolphin3-r1-mistral",
-            "name": "Dolphin 3.0 R1 Mistral 24B",
+            "id": "fredrezones55/Qwen3.5-Uncensored-HauhauCS-Aggressive:9b",
+            "name": "Qwen 3.5 9b Uncen (Dense)",
             "size_gb": 13.0,
             "max_context": 32768,
             "quantization": "Q4_K_M",
@@ -51,21 +72,6 @@
             "system_prompt_type": "phi4",
             "recommended_use": "STEM, mathematical reasoning, and logical problem solving"
         },
-        {
-            "id": "qooba/qwen3-coder-30b-a3b-instruct:q3_k_m",
-            "name": "Qwen3 Coder 30B (MoE)",
-            "size_gb": 14.0,
-            "max_context": 262144,
-            "quantization": "Q4_K_M",
-            "capabilities": {
-                "vision": false,
-                "function_calling": true,
-                "thinking_mode": false,
-                "uncensored": false
-            },
-            "system_prompt_type": "qwen",
-            "recommended_use": "Full codebase engineering, complex script generation, repository editing"
-        },
    {
             "id": "Qwen3-8-27_16k:latest",
             "name": "Qwen 3.8 27B (Dense)",
@@ -73,7 +79,7 @@
             "max_context": 262000,
             "quantization": "none",
             "capabilities": {
-                "vision": true,
+                "vision": false,
                 "function_calling": true,
                 "thinking_mode": true,
                 "uncensored": false
@@ -150,7 +156,7 @@
             "max_context": 262144,
             "quantization": "Q4_K_M",
             "capabilities": {
-                "vision": true,
+                "vision": false,
                 "function_calling": true,
                 "thinking_mode": true,
                 "uncensored": true
@@ -161,55 +167,6 @@
             },
             "system_prompt_type": "qwen",
             "recommended_use": "VRAM-efficient long context reasoning"
-        },
-        {
-            "id": "phi3:latest",
-            "name": "Microsoft Phi-3 Mini (3.8B, 4K)",
-            "size_gb": 2.2,
-            "max_context": 4096,
-            "quantization": "Q4_K_M",
-            "capabilities": {
-                "vision": false,
-                "function_calling": false,
-                "thinking_mode": false,
-                "uncensored": false
-            },
-            "system_prompt_type": "phi3",
-            "recommended_use": "Ultra-fast low-resource text processing"
-        },
-        {
-            "id": "granite3-moe:latest",
-            "name": "IBM Granite 3.0 MoE",
-            "size_gb": 0.82,
-            "max_context": 4096,
-            "quantization": "Q4_K_M",
-            "capabilities": {
-                "vision": false,
-                "function_calling": true,
-                "thinking_mode": false,
-                "uncensored": false
-            },
-            "system_prompt_type": "granite",
-            "recommended_use": "Ultra-lightweight background classification, intent detection, and quick tool calling"
-        },
-        {
-            "id": "nemotron-orchestrator-8b-qwen3-distill_q4_k_m:latest",
-            "name": "Nemotron Orchestrator 8B (Qwen3-8B base)",
-            "size_gb": 5.0,
-            "max_context": 32768,
-            "quantization": "Q4_K_M",
-            "capabilities": {
-                "vision": false,
-                "function_calling": true,
-                "thinking_mode": true,
-                "uncensored": false
-            },
-            "thinking_config": {
-                "tag": "think",
-                "default_enabled": true
-            },
-            "system_prompt_type": "chatml",
-            "recommended_use": "Agent orchestration, structured workflow execution, multi-tool planning"
         },
         {
             "id": "muse-glimmer:30b",
@@ -247,7 +204,7 @@
                 "default_enabled": true
             },
             "system_prompt_type": "gemma",
-            "recommended_use": "Multimodal image understanding, visual coding, uncensored complex tasks"
+            "recommended_use": "Multimodal image understanding and uncensored tasks. NOT recommended as the primary coding model: highest tool-call failure rate on this 32GB shared-RAM setup (spawn/overwrite loops). Use qwen3-coder:30b for the coder persona."
         },
         {
             "id": "gemma4:26b-uncensored",
@@ -266,7 +223,7 @@
                 "default_enabled": true
             },
             "system_prompt_type": "gemma",
-            "recommended_use": "Multimodal image understanding, visual coding, uncensored complex tasks"
+            "recommended_use": "Uncensored complex tasks. NOT recommended as the primary coding model on this 32GB setup; use qwen3-coder:30b for the coder persona."
         }
     ]
 }

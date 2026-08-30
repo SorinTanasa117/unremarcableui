@@ -70,6 +70,88 @@ To ask stock Ollama to use Vulkan runner on Intel iGPU:
 
 ---
 
+## 🧩 Role-Based Model Switching (auto sidecar swaps)
+
+To keep coding effective on 32 GB shared LPDDR5 without loading several large
+models at once, the server can swap in a small auxiliary model for two bounded
+jobs, then unload it (`keep_alive: 0`) so the primary coder keeps the RAM.
+
+Configure the roles in `model_map.json`:
+
+```jsonc
+"roles": {
+  "coder":      "qooba/qwen3-coder-30b-a3b-instruct:q3_k_m", // doc only — primary coder is your UI pick
+  "summarizer": "qwen3:4b",                                  // folds old turns into a durable brief
+  "vision":     "huihui_ai/qwen3-vl-abliterated:2b"          // describes images for non-vision coders
+}
+```
+
+`coder` is documentation only; the model actually used for the run is whatever you select in the UI.
+Only `summarizer` and `vision` are swapped in as one-shot sidecars.
+
+- **Vision ingest:** attach an image while a non-vision coder is selected and the
+  `vision` model describes it once; the text is injected into context and the raw
+  image bytes are dropped so they are not re-encoded every turn.
+- **Rolling summary:** when the running context passes ~50 % of the window, the
+  `summarizer` model compresses the older turns into a pinned brief that survives
+  turn-dropping.
+- **Final code review:** when a coder run finishes having changed files, the
+  `reviewer` model gets ONE look at them (first ~120 lines per file) and flags
+  only blocking defects (`file:line: issue`). Findings are handed to the coder
+  for one repair round before the run completes; a clean or missing reviewer
+  changes nothing. Disable with `REVIEW_AT_END=false`. There is deliberately no
+  per-turn checking — on `OLLAMA_MAX_LOADED_MODELS=1` every swap would evict the
+  coder's prompt cache, so checks happen once at the end instead.
+
+If a role model is not installed, each feature silently falls back
+(heuristic compaction notice; raw image skipped; review skipped).
+
+### Stall & hang protection (watchdog)
+
+Long local runs can stall silently — most often because Ollama unloads the model
+mid-run under memory pressure on a shared-memory laptop, leaving the request
+hanging with zero tokens. Guards, fastest to coarsest:
+
+- **Model-eviction stop (Ollama):** every `MODEL_PS_INTERVAL_MS` (default 60s)
+  the server polls `ollama ps` (GET `/api/ps`). If no model is resident for
+  `MODEL_GONE_CHECKS_TO_KILL` consecutive polls (default 2, ≈2 min) the run
+  stops with reason **model ejected**. A resident-but-slow prefill still lists
+  the model, so healthy long generations are never touched. Disable with
+  `MODEL_EVICTION_WATCH=false`.
+- **Proven-hang stop:** after `STALL_QUIET_MS` of zero tokens (default 30 min)
+  the server measures real CPU work (cumulative process CPU-seconds sampled
+  twice per probe — not an instantaneous rate). Only genuine zero-compute for
+  `WATCHDOG_IDLE_PROBES_TO_KILL` consecutive probes (default 20 × 15s ≈ 5 min)
+  ends the run, and the idle count-down is shown in the UI.
+- **Wall-clock budgets:** one turn ≤ `TURN_MAX_DURATION_MS` (default 60 min),
+  whole run ≤ `RUN_MAX_DURATION_MS` (default 6 h).
+
+Disable everything with `RUN_WATCHDOG=false`. On a 32 GB shared-memory laptop,
+shorter values are worth setting (see `.env.example`): e.g. `STALL_QUIET_MS=600000`
+(10 min) and `TURN_MAX_DURATION_MS=1500000` (25 min).
+
+### What you already have vs. what to pull
+
+Your existing models already cover two of the three roles:
+- **coder** — `qooba/qwen3-coder-30b-a3b-instruct:q3_k_m` (already installed; fine as the primary).
+- **vision** — `huihui_ai/qwen3-vl-abliterated:2b` (already installed; used to describe images).
+
+Only the summarizer is missing:
+
+```bash
+ollama pull qwen3:4b           # summarizer / orchestrator sidecar, ~2.6 GB
+```
+
+Optional upgrades if you want them:
+```bash
+ollama pull qwen2.5vl:3b       # lighter Q4 vision sidecar (~3 GB) — faster keep_alive:0 swaps than the 8.5 GB Q8 2b
+ollama pull qwen3-coder:30b    # official Q4_K_M coder (~19 GB) — a step up from the q3_k_m build if RAM allows
+```
+
+`gemma4:26b` is intentionally **not** recommended as the coder persona model: it
+had the highest tool-call failure rate (spawn errors, overwrite-regeneration
+loops) in local testing. Keep it for uncensored/multimodal chat only.
+
 ## 🛠️ Recommended Models for CPU Research
 
 We recommend using the following lightweight, native tool-calling models that balance high analytical reasoning with low memory overhead:

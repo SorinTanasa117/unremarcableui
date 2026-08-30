@@ -106,6 +106,10 @@ interface Props {
   autopilotInstalls: boolean;
   /** Selected model reports vision: true in model_map — enables image attach/paste. */
   visionSupported: boolean;
+  /** Configured vision sidecar model id (model_map roles.vision). When set, a
+   *  non-vision coder can still take images: the backend describes them with
+   *  this model and hands the text to the coder. */
+  visionSidecarModel?: string;
   sidebarOpen: boolean;
   rightPanelOpen: boolean;
   hasNovelOutline: boolean;
@@ -133,6 +137,7 @@ export function ChatPanel({
   cavemanMode,
   autopilotInstalls,
   visionSupported,
+  visionSidecarModel,
   sidebarOpen,
   rightPanelOpen,
   hasNovelOutline,
@@ -150,9 +155,13 @@ export function ChatPanel({
   const isRunning = status === 'thinking' || status === 'tool';
   const showStartChapter = persona === 'novelist' && hasNovelOutline;
 
-  // Text files (csv/txt) work with any model; images only when the model has
-  // vision. The picker's accept list mirrors that gate.
-  const acceptAttr = visionSupported
+  // Text files (csv/txt) work with any model. Images work when the selected
+  // model has native vision OR a vision sidecar is configured (roles.vision) —
+  // in the latter case the backend describes the image and hands the text to
+  // the non-vision coder. The picker's accept list mirrors that gate.
+  const usesVisionSidecar = !visionSupported && Boolean(visionSidecarModel);
+  const imagesAllowed = visionSupported || Boolean(visionSidecarModel);
+  const acceptAttr = imagesAllowed
     ? '.csv,.txt,.jpg,.jpeg,.png,.bmp,.webp,text/csv,text/plain,image/jpeg,image/png,image/bmp,image/webp'
     : '.csv,.txt,text/csv,text/plain';
 
@@ -162,7 +171,7 @@ export function ChatPanel({
     for (const file of files) {
       const kind = classifyFile(file);
       if (!kind) continue;
-      if (kind === 'image' && !visionSupported) { blockedImage = true; continue; }
+      if (kind === 'image' && !imagesAllowed) { blockedImage = true; continue; }
       const mimeType = normalizeMime(file, kind);
       const name = file.name && file.name.trim()
         ? file.name
@@ -180,10 +189,12 @@ export function ChatPanel({
       }
     }
     if (blockedImage) {
-      setVisionWarning('Selected model has no vision — image attachments were skipped. Switch to a vision-capable model to send images.');
+      setVisionWarning('No vision available — image attachments were skipped. Select a vision model or configure a vision sidecar (roles.vision) to send images.');
+    } else if (usesVisionSidecar && collected.some((c) => c.kind === 'image')) {
+      setVisionWarning(`Selected model can't see images; ${visionSidecarModel} will describe them and pass the text to it.`);
     }
     if (collected.length) setAttachments((cur) => [...cur, ...collected].slice(0, MAX_ATTACHMENTS));
-  }, [visionSupported]);
+  }, [imagesAllowed, usesVisionSidecar, visionSidecarModel]);
 
   const onFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.length) void addFiles(Array.from(e.target.files));
@@ -207,12 +218,12 @@ export function ChatPanel({
     if (!files.length) return;
     // Don't drop a pasted screenshot into the textarea as junk; consume it.
     e.preventDefault();
-    if (!visionSupported) {
-      setVisionWarning('Selected model has no vision — pasted image ignored. Switch to a vision-capable model to send images.');
+    if (!imagesAllowed) {
+      setVisionWarning('No vision available — pasted image ignored. Select a vision model or configure a vision sidecar (roles.vision) to send images.');
       return;
     }
     void addFiles(files);
-  }, [visionSupported, addFiles]);
+  }, [imagesAllowed, addFiles]);
 
   // Clear the warning once a vision model is active; auto-dismiss otherwise.
   useEffect(() => {
@@ -244,11 +255,11 @@ export function ChatPanel({
   const submit = useCallback(() => {
     const text = input.trim();
     if (!model || isRunning) return;
-    const sendableAttachments = visionSupported
+    const sendableAttachments = imagesAllowed
       ? attachments
       : attachments.filter((attachment) => attachment.kind !== 'image');
     if (sendableAttachments.length !== attachments.length) {
-      setVisionWarning('Selected model has no vision — image attachments were skipped. Switch to a vision-capable model to send images.');
+      setVisionWarning('No vision available — image attachments were skipped. Select a vision model or configure a vision sidecar (roles.vision) to send images.');
       setAttachments(sendableAttachments);
     }
     if (!text && sendableAttachments.length === 0) return;
@@ -270,7 +281,7 @@ export function ChatPanel({
       cloudProvider,
       ...(outgoing.length ? { attachments: outgoing } : {}),
     });
-  }, [input, attachments, isRunning, model, sessionId, sendMessage, persona, contextSize, thinkingMode, numThread, inferenceBackend, cavemanMode, autopilotInstalls, cloudProvider, visionSupported]);
+  }, [input, attachments, isRunning, model, sessionId, sendMessage, persona, contextSize, thinkingMode, numThread, inferenceBackend, cavemanMode, autopilotInstalls, cloudProvider, imagesAllowed]);
 
   const handleKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -454,9 +465,11 @@ export function ChatPanel({
               className="btn btn-icon"
               onClick={() => fileInputRef.current?.click()}
               disabled={isRunning}
-              title={visionSupported
-                ? 'Attach files (csv, txt, jpg, png, bmp, webp)'
-                : 'Attach text files (csv, txt). Selected model has no vision for images.'}
+              title={imagesAllowed
+                ? (usesVisionSidecar
+                    ? `Attach files (csv, txt, images). Images are described by ${visionSidecarModel} and passed to this non-vision model.`
+                    : 'Attach files (csv, txt, jpg, png, bmp, webp)')
+                : 'Attach text files (csv, txt). No vision model or sidecar available for images.'}
               style={{ alignSelf: 'flex-end' }}
             >
               +

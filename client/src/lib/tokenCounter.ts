@@ -5,8 +5,9 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
-export function getTokenPercentage(count: number): number {
-  return Math.min((count / MAX_TOKENS) * 100, 100);
+export function getTokenPercentage(count: number, maxTokens: number = MAX_TOKENS): number {
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) return 0;
+  return Math.min((count / maxTokens) * 100, 100);
 }
 
 export function formatTokenCount(count: number): string {
@@ -53,22 +54,28 @@ export class TokenRateTracker {
     if (!this.startedAt) this.startedAt = timestamp;
     this.promptTokens = Math.max(this.promptTokens, input);
 
-    if (output > 0 && !this.generationStartedAt) {
-      this.generationStartedAt = timestamp;
+    const last = this.samples[this.samples.length - 1];
+    if (!last) {
       this.generationStartOutput = output;
+      this.samples.push({ timestamp, input, output });
+      return this.rates(timestamp);
     }
 
-    const last = this.samples[this.samples.length - 1];
+    if (output > last.output && !this.generationStartedAt) {
+      this.generationStartedAt = timestamp;
+      this.generationStartOutput = last.output;
+    }
+
     // Update timestamp of an unchanged count rather than creating a duplicate
     // sample — keeps the ring strictly monotone in (input, output) so a single
     // event cannot temporarily skew the rate to zero.
     if (last && last.input === input && last.output === output) {
       last.timestamp = timestamp;
-      return this.rates();
+      return this.rates(timestamp);
     }
     this.samples.push({ timestamp, input, output });
     while (this.samples.length > this.maxSamples) this.samples.shift();
-    return this.rates();
+    return this.rates(timestamp);
   }
 
   reset() {
@@ -85,14 +92,19 @@ export class TokenRateTracker {
    */
   rates(now: number = Date.now()): { read: number; write: number; active: boolean } {
     const last = this.samples[this.samples.length - 1];
+    const generationQuiet = Boolean(
+      this.generationStartedAt
+      && last
+      && now - last.timestamp > 3_000,
+    );
     const readElapsed = (this.generationStartedAt || now) - this.startedAt;
-    const read = this.promptTokens > 0 && readElapsed > 0
+    const read = !generationQuiet && this.promptTokens > 0 && readElapsed > 0
       ? this.promptTokens / (readElapsed / 1000)
       : 0;
     const writeElapsed = this.generationStartedAt && last
       ? last.timestamp - this.generationStartedAt
       : 0;
-    const write = writeElapsed > 0 && last
+    const write = !generationQuiet && writeElapsed > 0 && last
       ? Math.max(0, (last.output - this.generationStartOutput) / (writeElapsed / 1000))
       : 0;
     return { read, write, active: read + write > 0 };
